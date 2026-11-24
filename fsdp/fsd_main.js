@@ -119,6 +119,7 @@ async function add_db_f_json(file) {
         rec.url_fh = item.url_fh || '';
         rec.file_p = item.file_p || '';
         rec.id_f = item.id_f || '';
+        rec.hash_f = item.hash_f || '';
         return rec;
     }, true);
 }
@@ -326,7 +327,8 @@ chrome.runtime.onMessage.addListener(function (mess) {
                 + '\nпоследний запуск: ' + formatDateTime(p.last_sw_start)
                 + '\nобработано URL: ' + (p.total_urls_processed || 0)
                 + '\nтаймаутов URL: ' + (p.total_urls_timeout || 0)
-                + '\nзавершено загрузок: ' + (p.total_downloads_completed || 0);
+                + '\nзавершено загрузок: ' + (p.total_downloads_completed || 0)
+                + '\nневалидных файлов: ' + (p.total_invalid_files || 0);
             metricsEl.style.whiteSpace = 'pre-line';
         }
         if (progress_story) {

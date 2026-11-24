@@ -48,6 +48,7 @@ export class t_rec_sl {
         this.url_fh = '';
         this.file_p = '';
         this.id_f = '';
+        this.hash_f = ''; // v1.3.2: md5 контента из API (hashes.epub) — детектор изменений
     }
 }
 
