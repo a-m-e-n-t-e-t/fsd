@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FSD</title>
+    <style>
+        :root {
+            --bg: #fff;
+            --fg: #222;
+            --muted: #666;
+            --border: #ddd;
+            --accent: #2a7de1;
+            --accent-bg: #e8f1ff;
+            --input-bg: #fff;
+            --input-border: #ccc;
+            --warn-bg: #fff4cc;
+            --log-debug: #888;
+            --log-info: #444;
+            --log-warn: #a66;
+            --log-error: #c33;
+            --log-ts: #999;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1a1a1a;
+                --fg: #eee;
+                --muted: #999;
+                --border: #444;
+                --accent: #5b9dff;
+                --accent-bg: #2a3a4f;
+                --input-bg: #2a2a2a;
+                --input-border: #555;
+                --warn-bg: #5c4a1a;
+                --log-debug: #888;
+                --log-info: #ccc;
+                --log-warn: #ffaa66;
+                --log-error: #ff6b6b;
+                --log-ts: #777;
+            }
+        }
+        body {
+            font-family: Arial, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            margin: 12px;
+            min-width: 520px;
+        }
+        table {
+            border-collapse: collapse;
+        }
+        td {
+            vertical-align: top;
+            padding: 0 8px;
+        }
+        .block {
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            padding: 8px 12px;
+            margin-bottom: 10px;
+            background: var(--bg);
+        }
+        .block-title {
+            font-weight: bold;
+            margin-bottom: 6px;
+            color: var(--accent);
+        }
+        input[type="button"] {
+            margin: 2px 0;
+            padding: 4px 8px;
+            background: var(--input-bg);
+            color: var(--fg);
+            border: 1px solid var(--input-border);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        input[type="button"]:disabled {
+            background: var(--bg);
+            color: var(--muted);
+            cursor: not-allowed;
+        }
+        input[type="button"]:hover:not(:disabled) {
+            background: var(--accent-bg);
+            border-color: var(--accent);
+        }
+        input[type="button"].active-pause {
+            background: var(--warn-bg);
+        }
+        input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            margin: 2px 0;
+            padding: 4px;
+            background: var(--input-bg);
+            color: var(--fg);
+            border: 1px solid var(--input-border);
+            border-radius: 3px;
+        }
+        .f_info {
+            color: var(--muted);
+            font-size: 12px;
+            margin: 4px 0;
+        }
+        .info {
+            white-space: pre-line;
+            font-size: 12px;
+            color: var(--fg);
+            background: var(--input-bg);
+            padding: 6px;
+            border-radius: 3px;
+            border: 1px solid var(--border);
+        }
+        .metrics {
+            font-size: 11px;
+            color: var(--muted);
+            white-space: pre-line;
+            background: var(--input-bg);
+            padding: 6px;
+            border-radius: 3px;
+            border: 1px solid var(--border);
+            max-height: 120px;
+            overflow-y: auto;
+        }
+        .log-toolbar {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .log-toolbar select, .log-toolbar input[type="button"] {
+            font-size: 11px;
+            padding: 2px 6px;
+        }
+        .log-box {
+            font-family: monospace;
+            font-size: 10px;
+            background: var(--input-bg);
+            color: var(--fg);
+            padding: 4px;
+            border-radius: 3px;
+            border: 1px solid var(--border);
+            height: 140px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .log-line { display: block; padding: 1px 0; }
+        .log-line.debug { color: var(--log-debug); }
+        .log-line.info { color: var(--log-info); }
+        .log-line.warn { color: var(--log-warn); }
+        .log-line.error { color: var(--log-error); }
+        .log-ts { color: var(--log-ts); margin-right: 4px; }
+        .log-src { font-weight: bold; margin-right: 4px; }
+        progress {
+            width: 100%;
+            margin: 4px 0;
+        }
+    </style>
+</head>
+<body>
+<table>
+<tr>
+<td>
+    <div class="block">
+        <div class="block-title">Загрузка</div>
+        <progress class="progress_story" max="100" value="0">
+            Загружено на <span class="value_story">0</span>%
+        </progress>
+        <div>
+            <input type="button" class="fsd_run" value="Загрузить"/>
+            <input type="button" class="fsd_audit" value="проверить все"/>
+            <input type="button" class="fsd_pause" value="Пауза"/>
+            <input type="button" class="fsd_resume" value="Продолжить"/>
+            <input type="button" class="fsd_stop" value="Стоп"/>
+            <input type="button" class="fsd_auto_check" value="Авто-проверка"/>
+            <input type="button" class="fsd_options" value="Настройки"/>
+        </div>
+    </div>
+
+    <div class="block">
+        <div class="block-title">Исправить записи</div>
+        <div>
+            <input type="button" class="fsd_fix" value="Исправить записи (fix)"/>
+            <input type="file" class="fsd_fix_f" multiple style="display:none">
+        </div>
+    </div>
+
+    <div class="block">
+        <div class="block-title">Добавить запись</div>
+        <div>URL <input type="text" name="story_url"/></div>
+        <div><input type="button" class="fsd_add" value="Добавить"/></div>
+        <div class="f_info">free</div>
+        <progress class="progress_f" max="100" value="0">
+            Загружено на <span class="value_f">0</span>%
+        </progress>
+        <div><input type="file" class="fsd_add_f"/></div>
+    </div>
+
+    <div class="block">
+        <div class="block-title">Выгрузить</div>
+        <div>
+            <input type="button" class="fsd_save_story_list" value="Ссылки историй"/>
+            <input type="button" class="fsd_save_dl" value="Ссылки загрузок"/>
+            <input type="button" class="JSON_file" value="JSON_file"/>
+            <input type="button" class="csv_file" value="csv"/>
+        </div>
+        <div>
+            <input type="button" class="read" value="читать"/>
+        </div>
+    </div>
+</td>
+<td style="min-width: 280px;">
+    <div class="block">
+        <div class="block-title">DB Инфо</div>
+        <div class="info"></div>
+    </div>
+    <div class="block">
+        <div class="block-title">Метрики</div>
+        <div class="metrics"></div>
+        <div><input type="button" class="reset_metrics" value="Сбросить метрики"/></div>
+    </div>
+    <div class="block">
+        <div class="block-title">Лог</div>
+        <div class="log-toolbar">
+            <select id="log_filter">
+                <option value="all">все</option>
+                <option value="debug">debug+</option>
+                <option value="info">info+</option>
+                <option value="warn">warn+</option>
+                <option value="error">error</option>
+            </select>
+            <input type="button" id="log_refresh" value="Обновить"/>
+            <input type="button" id="log_clear" value="Очистить"/>
+        </div>
+        <div class="log-box" id="log_box"></div>
+    </div>
+</td>
+</tr>
+</table>
+<script type="module" src="fsd_main.js"></script>
+</body>
+</html>

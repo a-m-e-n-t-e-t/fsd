@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FSD — Настройки</title>
+    <style>
+        :root {
+            --bg: #fff;
+            --fg: #222;
+            --muted: #666;
+            --border: #ddd;
+            --accent: #2a7de1;
+            --accent-bg: #e8f1ff;
+            --input-bg: #fff;
+            --input-border: #ccc;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1a1a1a;
+                --fg: #eee;
+                --muted: #999;
+                --border: #444;
+                --accent: #5b9dff;
+                --accent-bg: #2a3a4f;
+                --input-bg: #2a2a2a;
+                --input-border: #555;
+            }
+        }
+        body {
+            font-family: Arial, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            margin: 20px auto;
+            max-width: 720px;
+            padding: 0 20px;
+        }
+        h1 {
+            margin-bottom: 8px;
+        }
+        .hint {
+            color: var(--muted);
+            font-size: 13px;
+            margin-bottom: 24px;
+        }
+        .block {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+        }
+        .block-title {
+            font-weight: bold;
+            font-size: 15px;
+            margin-bottom: 12px;
+            color: var(--accent);
+        }
+        .row {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            align-items: center;
+            margin-bottom: 10px;
+            gap: 12px;
+        }
+        .row label {
+            font-size: 13px;
+        }
+        .row .row-hint {
+            grid-column: 2 / 3;
+            color: var(--muted);
+            font-size: 11px;
+            margin-top: 2px;
+        }
+        input[type="number"] {
+            width: 100%;
+            padding: 4px 6px;
+            font-size: 13px;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            border-radius: 3px;
+            color: var(--fg);
+            box-sizing: border-box;
+        }
+        select {
+            padding: 4px 6px;
+            font-size: 13px;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            border-radius: 3px;
+            color: var(--fg);
+        }
+        .buttons {
+            margin-top: 24px;
+            display: flex;
+            gap: 10px;
+        }
+        input[type="button"] {
+            padding: 8px 16px;
+            font-size: 13px;
+            cursor: pointer;
+            border: 1px solid var(--input-border);
+            background: var(--input-bg);
+            color: var(--fg);
+            border-radius: 4px;
+        }
+        input[type="button"]:hover {
+            background: var(--accent-bg);
+            border-color: var(--accent);
+        }
+        .status-line {
+            margin-top: 12px;
+            font-size: 12px;
+            color: var(--muted);
+            min-height: 18px;
+        }
+        .status-line.ok { color: #2a8c2a; }
+        .status-line.error { color: #c33; }
+        @media (prefers-color-scheme: dark) {
+            .status-line.ok { color: #5dd95d; }
+            .status-line.error { color: #ff6b6b; }
+        }
+    </style>
+</head>
+<body>
+<h1>FSD — Настройки</h1>
+<div class="hint">Изменения применяются немедленно. Часть значений вступает в силу при следующем запуске обработки.</div>
+
+<div class="block">
+    <div class="block-title">Загрузки</div>
+    <div class="row">
+        <label for="MAX_CONCURRENT_DOWNLOADS">Параллельных загрузок</label>
+        <input type="number" id="MAX_CONCURRENT_DOWNLOADS" min="1" max="10" step="1"/>
+        <div class="row-hint">1–10. Больше = быстрее, но выше риск throttling'а</div>
+    </div>
+    <div class="row">
+        <label for="DOWNLOAD_TIMEOUT_MS">Таймаут загрузки (минуты)</label>
+        <input type="number" id="DOWNLOAD_TIMEOUT_MS_MIN" min="1" max="60" step="1"/>
+        <div class="row-hint">1–60. Watchdog — загрузка помечается как timeout</div>
+    </div>
+    <div class="row">
+        <label for="PROCESS_NEXT_DELAY_MS">Пауза между URL (секунды)</label>
+        <input type="number" id="PROCESS_NEXT_DELAY_MS_SEC" min="0" max="120" step="1"/>
+        <div class="row-hint">0–120. Анти-throttling пауза перед следующим URL</div>
+    </div>
+    <div class="row">
+        <label for="API_REQUEST_DELAY_MS">Пауза после API (секунды)</label>
+        <input type="number" id="API_REQUEST_DELAY_MS_SEC" min="0" max="120" step="1"/>
+        <div class="row-hint">0–120. Между запросами к fichub.net</div>
+    </div>
+</div>
+
+<div class="block">
+    <div class="block-title">HTTP 429 backoff</div>
+    <div class="row">
+        <label for="API_429_BASE_DELAY_MS">Начальная задержка (секунды)</label>
+        <input type="number" id="API_429_BASE_DELAY_MS_SEC" min="1" max="600" step="1"/>
+        <div class="row-hint">1–600. Старт при первом 429</div>
+    </div>
+    <div class="row">
+        <label for="API_429_MAX_DELAY_MS">Макс. задержка (секунды)</label>
+        <input type="number" id="API_429_MAX_DELAY_MS_SEC" min="10" max="3600" step="10"/>
+        <div class="row-hint">10–3600. Потолок экспоненциального backoff</div>
+    </div>
+</div>
+
+<div class="block">
+    <div class="block-title">Авто-проверка обновлений (ongoing-истории)</div>
+    <div class="row">
+        <label for="AUTO_CHECK_ENABLED">Включить авто-проверку</label>
+        <select id="AUTO_CHECK_ENABLED">
+            <option value="true">Да</option>
+            <option value="false">Нет</option>
+        </select>
+        <div class="row-hint">Периодически проверяет обновления для статуса 'ongoing'</div>
+    </div>
+    <div class="row">
+        <label for="AUTO_CHECK_INTERVAL_HOURS">Интервал (часы)</label>
+        <input type="number" id="AUTO_CHECK_INTERVAL_HOURS" min="1" max="168" step="1"/>
+        <div class="row-hint">1–168 (1 час – 7 дней)</div>
+    </div>
+</div>
+
+<div class="block">
+    <div class="block-title">Валидация скачанных файлов</div>
+    <div class="row">
+        <label for="VALIDATE_FILE_SIGNATURE">Проверять MIME/сигнатуру</label>
+        <select id="VALIDATE_FILE_SIGNATURE">
+            <option value="true">Да</option>
+            <option value="false">Нет</option>
+        </select>
+        <div class="row-hint">Отбрасывает error pages и невалидные типы</div>
+    </div>
+    <div class="row">
+        <label for="MIN_FILE_SIZE_BYTES">Мин. размер файла (байты)</label>
+        <input type="number" id="MIN_FILE_SIZE_BYTES" min="0" max="1048576" step="1024"/>
+        <div class="row-hint">0–1 МБ. Файлы меньше этого размера помечаются как invalid</div>
+    </div>
+</div>
+
+<div class="block">
+    <div class="block-title">Keepalive service worker</div>
+    <div class="row">
+        <label for="KEEPALIVE_PERIOD_MIN">Интервал keepalive (минуты)</label>
+        <input type="number" id="KEEPALIVE_PERIOD_MIN" min="0.5" max="5" step="0.5"/>
+        <div class="row-hint">0.5–5. Минимум 0.5 (30 сек) — Chrome MV3 ограничение</div>
+    </div>
+</div>
+
+<div class="block">
+    <div class="block-title">Логирование</div>
+    <div class="row">
+        <label for="LOG_LEVEL">Уровень логирования</label>
+        <select id="LOG_LEVEL">
+            <option value="debug">debug (всё)</option>
+            <option value="info">info (по умолчанию)</option>
+            <option value="warn">warn (только предупреждения)</option>
+            <option value="error">error (только ошибки)</option>
+        </select>
+        <div class="row-hint">Фильтр persistent лога в chrome.storage.local</div>
+    </div>
+    <div class="row">
+        <label for="MAX_LOG_ENTRIES">Макс. записей в логе</label>
+        <input type="number" id="MAX_LOG_ENTRIES" min="50" max="2000" step="50"/>
+        <div class="row-hint">50–2000. Кольцевой буфер (старые вытесняются)</div>
+    </div>
+</div>
+
+<div class="buttons">
+    <input type="button" id="save" value="Сохранить"/>
+    <input type="button" id="reset" value="Сбросить к дефолтам"/>
+</div>
+<div class="status-line" id="status"></div>
+
+<script type="module" src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "FSD — Fanfiction Story Downloader",
+  "version": "1.3.1",
+  "description": "Загрузка фанфиков с fichub.net: фоновая обработка очереди (MV3, alarms, state machine), pause/resume, metrics, настройки, авто-проверка обновлений, валидация файлов, persistent лог, тёмная тема",
+  "permissions": [
+    "downloads",
+    "storage",
+    "alarms",
+    "tabs",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://fichub.net/*",
+    "https://*.fichub.net/*"
+  ],
+  "icons": {
+    "128": "fsd.png"
+  },
+  "background": {
+    "service_worker": "fsd_background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "FSD",
+    "default_popup": "fsd_main.html",
+    "default_icon": {
+      "128": "fsd.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
