@@ -46,7 +46,10 @@ function S() { return getCachedSettings(); }
 
 // Константы (не настраиваемые — структурные)
 const STATUS_BATCH = 100;
-const NEEDS_UPDATE_STATUSES = new Set(['ongoing', 'timeout', 'not_found', 'invalid', '']);
+// v1.3.2: 'invalid' убран — записи с невалидным файлом больше не попадают
+// в очередь при каждой проверке (вечная перекачка). Реанимация старых
+// 'invalid'-записей — разовая миграция resetInvalidStatuses() при обновлении.
+const NEEDS_UPDATE_STATUSES = new Set(['ongoing', 'timeout', 'not_found', '']);
 const PATH_SEPARATOR_REGEX = /[/\\]/;
 const CLEAN_NUMBER_SUFFIX_REGEX = /\s*\(\d+\)/g;
 
@@ -54,6 +57,9 @@ const FICHUB_API_BASE = 'https://fichub.net/api/v0/epub?q=';
 const API_MAX_RETRIES = 60;
 const API_DEFAULT_RETRY_DELAY_SEC = 5;
 const API_NETWORK_ERROR_DELAY_MS = 5000;
+// v1.3.2: таймаут одного запроса к API — зависший fetch раньше держал
+// обработка URL до срабатывания STUCK- watchdog'а (5 минут)
+const API_FETCH_TIMEOUT_MS = 60 * 1000;
 // v1.3.1: постоянные клиентские ошибки — ретраи бессмысленны (fail-fast)
 const API_FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 410]);
 const DATE_REGEX = /Updated:\s*(?:<[^>]+>)*(\d{4}-\d{2}-\d{2})/;
@@ -282,6 +288,7 @@ function sendStatus() {
                     total_urls_processed: metrics.total_urls_processed,
                     total_urls_timeout: metrics.total_urls_timeout,
                     total_downloads_completed: metrics.total_downloads_completed,
+                    total_invalid_files: metrics.total_invalid_files,
                 },
             }).catch(() => {});
         } catch (e) {
@@ -299,7 +306,7 @@ function audit_fields(v) {
     return v;
 }
 
-const RECORD_FIELDS = ['url_s', 'name', 's_status', 'date_upd', 'url_fh', 'file_p', 'id_f'];
+const RECORD_FIELDS = ['url_s', 'name', 's_status', 'date_upd', 'url_fh', 'file_p', 'id_f', 'hash_f'];
 function recordsDiffer(a, b) {
     return RECORD_FIELDS.some(f => a[f] !== b[f]);
 }
@@ -357,7 +364,9 @@ async function fetchEpubApi(url_s) {
 
         let resp;
         try {
-            resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s));
+            resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s), {
+                signal: AbortSignal.timeout(API_FETCH_TIMEOUT_MS),
+            });
         } catch (e) {
             console.warn('fetchEpubApi: сетевая ошибка, попытка', state.attempt + 1, e);
             state.attempt++;
@@ -483,6 +492,9 @@ async function fetchEpubApi(url_s) {
                 }
             }
 
+            // v1.3.2: md5 контента из ответа API — надёжный детектор изменений
+            // (url_fh после fixUrl не содержит ?h=/eh= и не меняется)
+            const hash_f = (res.hashes && (res.hashes.epub || res.hashes.html)) || '';
             console.log('fetchEpubApi: успех, url_fh =', urls.html || urls.epub);
             await saveFetchState(url_s, null);
             return {
@@ -491,6 +503,7 @@ async function fetchEpubApi(url_s) {
                 urls,
                 s_status,
                 date_upd: r_date.toISOString(),
+                hash_f,
             };
         }
 
@@ -541,6 +554,7 @@ async function processUrl(url_s) {
                 date_upd: result.date_upd,
                 file_p: '',
                 id_f: '',
+                hash_f: result.hash_f || '',
             }, false);
         }
 
@@ -622,6 +636,7 @@ async function fix(arr_file_p = []) {
         const cleanedName = record_sl.file_p.replace(CLEAN_NUMBER_SUFFIX_REGEX, '');
         if (cleanedName !== record_sl.file_p) record_sl.file_p = cleanedName;
         record_sl.id_f = original.id_f || '';
+        record_sl.hash_f = audit_fields(original.hash_f); // v1.3.2: сохраняем hash при нормализации
         if (record_sl.file_p !== '') {
             filePCounts.set(record_sl.file_p, (filePCounts.get(record_sl.file_p) || 0) + 1);
         }
@@ -689,8 +704,10 @@ async function create_arr_sl(regim) {
         if (regim === 0) {
             array_sl.push(v.url_s);
         } else if (regim === 1) {
+            // v1.3.2: 'invalid' автоматически не переспрашиваем — только
+            // вручную (add_url) или полным аудитом (regim=0)
             const needsUpdate = !v.url_fh
-                || !v.file_p
+                || (!v.file_p && v.s_status !== 'invalid')
                 || NEEDS_UPDATE_STATUSES.has(v.s_status);
             if (needsUpdate) {
                 array_sl.push(v.url_s);
@@ -920,15 +937,25 @@ async function add_sl(exp_rec, noDownload = false) {
     record_sl.name = buildFileName(record_sl.url_s);
     record_sl.file_p = exp_rec.file_p || '';
     record_sl.id_f = exp_rec.id_f || '';
+    record_sl.hash_f = exp_rec.hash_f || '';
 
     const db = await getDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const exist_rec = (await tx.store.get(record_sl.url_s)) || new t_rec_sl();
     const exist_date = parseDate(exist_rec.date_upd);
 
+    // v1.3.2: изменение контента по md5 (изменился — перекачиваем;
+    // первый hash — только сохраняем, без перекачки)
+    const hashChanged = record_sl.hash_f !== ''
+        && exist_rec.hash_f !== ''
+        && record_sl.hash_f !== exist_rec.hash_f;
+    const hashNew = record_sl.hash_f !== '' && exist_rec.hash_f === '';
+
     const reasons = [];
     if (parsed_date > exist_date) reasons.push('новая дата');
     if (record_sl.url_fh !== '' && record_sl.url_fh !== exist_rec.url_fh) reasons.push('новый url_fh');
+    if (hashChanged) reasons.push('изменился hash контента');
+    if (hashNew) reasons.push('первый hash');
     if (exist_rec.file_p === '') reasons.push('нет file_p');
     if (record_sl.s_status !== exist_rec.s_status) {
         reasons.push('статус: ' + exist_rec.s_status + ' → ' + record_sl.s_status);
@@ -960,9 +987,20 @@ async function add_sl(exp_rec, noDownload = false) {
             needDownload = true;
         }
         console.log('new url');
+    } else if (hashChanged) {
+        // v1.3.2: контент изменился при той же дате и url — перекачиваем
+        if (!noDownload) {
+            record_sl.file_p = '';
+            record_sl.id_f = '';
+            needDownload = true;
+        }
+        console.log('new hash');
     } else if (record_sl.s_status !== exist_rec.s_status) {
         record_sl.file_p = exist_rec.file_p || '';
         record_sl.id_f = exist_rec.id_f || '';
+        // v1.3.2: статус изменился, а файла нет — скачиваем (реанимация
+        // записей со сброшенным 'invalid' за один проход проверки)
+        needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new status');
     } else {
         record_sl.file_p = exist_rec.file_p || '';
@@ -1030,10 +1068,12 @@ async function handleDownloadComplete(delta, dwd) {
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
             fsd_monitor.c_u_s++;
+            await updateMetrics(m => { m.total_downloads_completed++; return m; });
             log('info', 'bg', 'загрузка завершена: ' + (rec.file_p || rec.url_s));
         }
     }
-    await updateMetrics(m => { m.total_downloads_completed++; return m; });
+    // v1.3.2: completed инкрементируется только для валидных файлов —
+    // раньше каждая отбракованная загрузка тоже считалась «завершённой»
     await persistRuntimeState();
     // v1.3.1: убрана 5-сек sleep в обработчике (держала SW живым;
     // pacing обеспечивает scheduleNext)
@@ -1353,6 +1393,36 @@ async function normalizeDatesIfNeeded() {
 }
 
 // ============================================================================
+// МИГРАЦИЯ (v1.3.2): разовая реанимация записей 'invalid'
+// До v1.3.1 валидация браковала html-файлы fichub (файл приходит как
+// application/zip) — записи получали s_status='invalid' и перекачивались
+// бесконечно. Валидация уже исправлена; при обновлении расширения один раз
+// сбрасываем статус, чтобы следующая проверка («Обновить БД», regim=1)
+// скачала корректные файлы и восстановила настоящий статус историй.
+// ============================================================================
+async function resetInvalidStatuses() {
+    try {
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        let reset = 0;
+        for await (const cursor of tx.store) {
+            const v = cursor.value;
+            if (v && v.s_status === 'invalid') {
+                v.s_status = '';
+                await cursor.update(v);
+                reset++;
+            }
+        }
+        await tx.done;
+        if (reset > 0) {
+            log('info', 'bg', 'миграция: сброшен статус invalid у записей: ' + reset);
+        }
+    } catch (e) {
+        console.warn('resetInvalidStatuses error:', e);
+    }
+}
+
+// ============================================================================
 // chrome.alarms.onAlarm — ГЛАВНАЯ ТОЧКА ВОЗОБНОВЛЕНИЯ SW ПОСЛЕ TERMINATION
 // ============================================================================
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -1650,6 +1720,10 @@ chrome.runtime.onStartup.addListener(async () => {
 
 chrome.runtime.onInstalled.addListener(async (details) => {
     console.log('onInstalled:', details.reason);
+    // v1.3.2: разовая реанимация записей, побитых старой валидацией
+    if (details.reason === 'update' || details.reason === 'install') {
+        await resetInvalidStatuses();
+    }
     await init();
 });
 
