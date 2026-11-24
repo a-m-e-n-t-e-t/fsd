@@ -510,7 +510,7 @@ async function fetchEpubApi(url_s) {
             };
         }
 
-        console.log('fetchEpubApi: нет ссылок, попытка', state.attempt);
+        console.log('fetchEpubApi: нет ссылок, попытка', state.attempt + 1);
         state.attempt++;
         await saveFetchState(url_s, state);
         await shortDelay(S().API_REQUEST_DELAY_MS);
@@ -1683,7 +1683,7 @@ async function handleAddUrl(mess) {
         if (mess.url_s && mess.url_s !== '') {
             exp = {
                 url_s: mess.url_s,
-                url_f: mess.url_f || '',
+                url_fh: mess.url_f || '',
                 s_status: mess.s_status || '',
                 date_upd: mess.date_upd || new Date(0).toISOString(),
             };
