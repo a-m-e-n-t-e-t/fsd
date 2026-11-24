@@ -492,8 +492,11 @@ async function fetchEpubApi(url_s) {
                 }
             }
 
-            // v1.3.2: md5 контента из ответа API — надёжный детектор изменений
-            // (url_fh после fixUrl не содержит ?h=/eh= и не меняется)
+            // v1.3.2: hash из ответа API (проверено: равен md5 сгенерированного
+            // файла). url_fh после fixUrl не содержит ?h=/eh= и не меняется,
+            // поэтому hash — единственный детектор изменений при той же дате/url.
+            // v1.3.3: при регенерации серверного кэша md5 меняется без изменения
+            // контента — перекачка по hash ограничена (см. add_sl)
             const hash_f = (res.hashes && (res.hashes.epub || res.hashes.html)) || '';
             console.log('fetchEpubApi: успех, url_fh =', urls.html || urls.epub);
             await saveFetchState(url_s, null);
@@ -507,7 +510,7 @@ async function fetchEpubApi(url_s) {
             };
         }
 
-        console.log('fetchEpubApi: нет ссылок, попытка', state.attempt + 1);
+        console.log('fetchEpubApi: нет ссылок, попытка', state.attempt);
         state.attempt++;
         await saveFetchState(url_s, state);
         await shortDelay(S().API_REQUEST_DELAY_MS);
@@ -944,8 +947,9 @@ async function add_sl(exp_rec, noDownload = false) {
     const exist_rec = (await tx.store.get(record_sl.url_s)) || new t_rec_sl();
     const exist_date = parseDate(exist_rec.date_upd);
 
-    // v1.3.2: изменение контента по md5 (изменился — перекачиваем;
-    // первый hash — только сохраняем, без перекачки)
+    // v1.3.2: изменение hash (первый hash — только сохраняем, без перекачки).
+    // v1.3.3: hash = md5 файла — меняется и при регенерации серверного кэша
+    // без изменения контента, поэтому перекачка ограничена (ветка hashChanged)
     const hashChanged = record_sl.hash_f !== ''
         && exist_rec.hash_f !== ''
         && record_sl.hash_f !== exist_rec.hash_f;
@@ -988,13 +992,22 @@ async function add_sl(exp_rec, noDownload = false) {
         }
         console.log('new url');
     } else if (hashChanged) {
-        // v1.3.2: контент изменился при той же дате и url — перекачиваем
-        if (!noDownload) {
+        // v1.3.3: hash = md5 файла; при регенерации серверного кэша он меняется
+        // без изменения контента. Перекачиваем только ongoing-истории (реальное
+        // обновление) или записи без файла; для old/complete с валидным файлом
+        // молча запоминаем новый hash, не трогая существующий файл.
+        const silentHashUpdate = record_sl.s_status !== 'ongoing' && exist_rec.file_p !== '';
+        if (!noDownload && !silentHashUpdate) {
             record_sl.file_p = '';
             record_sl.id_f = '';
             needDownload = true;
+            console.log('new hash — перекачка');
+        } else {
+            record_sl.file_p = exist_rec.file_p || '';
+            record_sl.id_f = exist_rec.id_f || '';
+            console.log('new hash — без перекачки',
+                silentHashUpdate ? '(не ongoing, файл есть)' : '');
         }
-        console.log('new hash');
     } else if (record_sl.s_status !== exist_rec.s_status) {
         record_sl.file_p = exist_rec.file_p || '';
         record_sl.id_f = exist_rec.id_f || '';
@@ -1670,7 +1683,7 @@ async function handleAddUrl(mess) {
         if (mess.url_s && mess.url_s !== '') {
             exp = {
                 url_s: mess.url_s,
-                url_fh: mess.url_f || '',
+                url_f: mess.url_f || '',
                 s_status: mess.s_status || '',
                 date_upd: mess.date_upd || new Date(0).toISOString(),
             };
