@@ -48,7 +48,7 @@ export class t_rec_sl {
         this.url_fh = '';
         this.file_p = '';
         this.id_f = '';
-        this.hash_f = ''; // v1.3.2: md5 контента из API (hashes.epub) — детектор изменений
+        this.hash_f = ''; // v1.3.2: md5 файла из ответа API (hashes.epub); v1.3.3: перекачка по hash — только ongoing/без файла
     }
 }
 
@@ -619,16 +619,21 @@ export async function clearLog() {
 // Раньше пустая строка '' в списке разрешённых MIME делала проверку
 // всегда истинной (мёртвая логика). Теперь:
 //   - text/html = error-страница, недопустим, если только мы не ждём
-//     HTML-историю (opts.expectHtml; fichub отдаёт html_url, после
-//     редиректа файл приходит как application/zip);
+//     HTML-историю (opts.expectHtml; fichub отдаёт html_url — это zip-архив);
 //   - известные MIME книжных форматов — точно перечислены;
 //   - пустой MIME — допускается (fichub иногда не отдаёт Content-Type).
+// v1.3.3: + application/x-zip-compressed и application/x-zip — Chrome на
+// Windows обозначает zip-файлы fichub (/cache/html/ и др.) именно так;
+// без них валидатор браковал ВСЕ html-загрузки → записи становились
+// 'invalid' и перекачивались бесконечно.
 // Возвращает { valid: boolean, reason: string }.
 // ============================================================================
 const ALLOWED_MIME_EXACT = [
     'application/epub+zip',
     'application/pdf',
     'application/zip',
+    'application/x-zip-compressed',
+    'application/x-zip',
     'application/x-mobipocket-ebook',
     'application/octet-stream',
 ];
