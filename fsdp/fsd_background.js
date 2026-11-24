@@ -58,7 +58,7 @@ const API_MAX_RETRIES = 60;
 const API_DEFAULT_RETRY_DELAY_SEC = 5;
 const API_NETWORK_ERROR_DELAY_MS = 5000;
 // v1.3.2: таймаут одного запроса к API — зависший fetch раньше держал
-// обработка URL до срабатывания STUCK- watchdog'а (5 минут)
+// обработку URL до срабатывания STUCK- watchdog'а (5 минут)
 const API_FETCH_TIMEOUT_MS = 60 * 1000;
 // v1.3.1: постоянные клиентские ошибки — ретраи бессмысленны (fail-fast)
 const API_FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 410]);
