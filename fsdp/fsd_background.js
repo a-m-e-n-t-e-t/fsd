@@ -62,6 +62,18 @@ const API_NETWORK_ERROR_DELAY_MS = 5000;
 const API_FETCH_TIMEOUT_MS = 60 * 1000;
 // v1.3.1: постоянные клиентские ошибки — ретраи бессмысленны (fail-fast)
 const API_FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 410]);
+// v1.3.4: постоянные ошибки загрузок Chrome — повторный запуск бессмысленен.
+// SERVER_BAD_CONTENT — fichub отдал 4xx вместо файла (кэш регенерируется);
+// USER_CANCELED — пользователь сам отменил загрузку, не воюем с ним.
+// Сетевые/файловые сбои (NETWORK_*, FILE_*) остаются ретраимыми.
+const PERMANENT_DL_ERRORS = new Set([
+    'SERVER_BAD_CONTENT',
+    'SERVER_FAILED',
+    'SERVER_UNAUTHORIZED',
+    'SERVER_CERT_PROBLEM',
+    'SERVER_FORBIDDEN',
+    'USER_CANCELED',
+]);
 const DATE_REGEX = /Updated:\s*(?:<[^>]+>)*(\d{4}-\d{2}-\d{2})/;
 const STATUS_REGEX = /Status:\s*(?:<[^>]+>)*([^<\r\n]+)/i;
 
@@ -97,6 +109,10 @@ const pendingDownloadTimeouts = new Set(); // normalizedUrl
 const activeDownloadUrls = new Set();      // url_fh — для лимита concurrency
 
 let _dlQueueCache = null; // v1.3.1: кэш download-очереди в памяти
+// v1.3.4: множество url_s в очереди — дедуп за O(1) вместо O(n) some()
+// (при большом импорте и медленных загрузках очередь растёт до тысяч
+// элементов, и квадратичный поиск тормозил каждый enqueue)
+let _dlQueueUrls = new Set();
 
 // ============================================================================
 // ХЕЛПЕРЫ
@@ -105,15 +121,23 @@ function shortDelay(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
+// v1.3.4: один общий onAlarm-листенер на все ожидания alarm'ов вместо
+// временного листенера на каждую задержку. Старый вариант протекал:
+// если alarm не срабатывал (например, 'stop' вычищает все fsd_* alarms),
+// листенер оставался висеть до смерти SW. Имена alarm'ов уникальны
+// (счётчик попыток / random-суффикс), перезаписи ожиданий в Map нет.
+const pendingAlarmWaits = new Map(); // alarmName → resolve
+chrome.alarms.onAlarm.addListener((alarm) => {
+    const resolve = pendingAlarmWaits.get(alarm.name);
+    if (resolve) {
+        pendingAlarmWaits.delete(alarm.name);
+        resolve();
+    }
+});
+
 function alarmDelay(name, delayMs) {
     return new Promise((resolve) => {
-        const handler = (alarm) => {
-            if (alarm.name === name) {
-                chrome.alarms.onAlarm.removeListener(handler);
-                resolve();
-            }
-        };
-        chrome.alarms.onAlarm.addListener(handler);
+        pendingAlarmWaits.set(name, resolve);
         chrome.alarms.create(name, {
             delayInMinutes: Math.max(delayMs / 60000, 0.5),
         });
@@ -610,6 +634,9 @@ async function fix(arr_file_p = []) {
     let del_file_p = 0;
     const filePCounts = new Map();
     const entries = [];
+    // v1.3.4: список файлов пользователя в Set — O(1) на запись вместо O(n)
+    // (на аудите большой БД со списком из сотен файлов экономит тысячи сравнений)
+    const arrFilePSet = arr_file_p.length > 0 ? new Set(arr_file_p) : null;
 
     for await (const cursor of tx.store) {
         if (!cursor.value) continue;
@@ -630,8 +657,8 @@ async function fix(arr_file_p = []) {
             const baseName = record_sl.file_p.split(PATH_SEPARATOR_REGEX).pop();
             if (baseName !== record_sl.file_p) record_sl.file_p = baseName;
         }
-        if (arr_file_p.length > 0) {
-            if (record_sl.file_p !== '' && !arr_file_p.includes(record_sl.file_p)) {
+        if (arrFilePSet) {
+            if (record_sl.file_p !== '' && !arrFilePSet.has(record_sl.file_p)) {
                 record_sl.file_p = '';
                 del_file_p++;
             }
@@ -659,8 +686,11 @@ async function fix(arr_file_p = []) {
         }
     }
 
+    // v1.3.4: puts без await — все запросы уходят в одну транзакцию одним
+    // батчем (было: N ожиданий round-trip). Ошибка транзакции всплывает
+    // через tx.done, индивидуальный catch гасит только дубль промиса.
     for (const record of fieldChanges) {
-        await tx.store.put(record);
+        tx.store.put(record).catch(() => {});
     }
     for (const change of keyChanges) {
         try {
@@ -850,6 +880,7 @@ function finishDownloadStep() {
 async function getDownloadQueue() {
     if (_dlQueueCache) return _dlQueueCache;
     _dlQueueCache = await loadDownloadQueue();
+    _dlQueueUrls = new Set(_dlQueueCache.map(item => item.url_s));
     return _dlQueueCache;
 }
 
@@ -861,8 +892,9 @@ async function flushDownloadQueue() {
 
 async function enqueueDownload(url_s, url_fh) {
     const queue = await getDownloadQueue();
-    // Не добавляем дубликаты
-    if (queue.some(item => item.url_s === url_s)) return;
+    // Не добавляем дубликаты (v1.3.4: проверка через Set — O(1))
+    if (_dlQueueUrls.has(url_s)) return;
+    _dlQueueUrls.add(url_s);
     queue.push({ url_s, url_fh, enqueued_at: Date.now() });
     // на диск сбросит flushDownloadQueue (один вызов на батч)
 }
@@ -876,6 +908,7 @@ async function pumpDownloadQueue() {
     let started = 0;
     while (queue.length > 0 && activeDownloadUrls.size < S().MAX_CONCURRENT_DOWNLOADS) {
         const item = queue.shift();
+        _dlQueueUrls.delete(item.url_s);
         started++;
         // Запускаем загрузку (в обход лимита, т.к. мы только что освободили слот)
         await startDownloadInternal(item.url_s, item.url_fh, { persist: false });
@@ -1071,12 +1104,21 @@ async function handleDownloadComplete(delta, dwd) {
             } catch (e) {
                 log('debug', 'bg', 'не удалось удалить невалидный файл', e);
             }
+            // v1.3.4: вычищаем запись из списка загрузок Chrome. Ошибочные
+            // ответы fichub (кэш регенерируется) приходят как application/json
+            // и Chrome сохраняет их мусорными <id>.json-файлами — теперь они
+            // не захламляют список загрузок пользователя.
+            try {
+                await chrome.downloads.erase({ id: delta.id });
+            } catch (e) {
+                log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e);
+            }
             fsd_monitor.c_e_s++;
             // v1.3.1: честная метрика вместо total_urls_timeout
             await updateMetrics(m => { m.total_invalid_files++; return m; });
         } else {
             const fullPath = downloadItem.filename || '';
-            rec.file_p = fullPath.split(/[/\\]/).pop();
+            rec.file_p = fullPath.split(PATH_SEPARATOR_REGEX).pop();
             rec.id_f = delta.id;
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
@@ -1103,8 +1145,17 @@ async function handleDownloadInterrupted(delta, dwd) {
     });
     await persistRuntimeState();
 
-    if (attempts > MAX_RESUME_ATTEMPTS) {
-        console.error('превышен лимит resume для:', delta.id);
+    // v1.3.4: fail-fast для постоянных ошибок сервера — раньше SERVER_BAD_CONTENT
+    // (fichub отдаёт 4xx вместо файла, пока кэш регенерируется) перемалывался
+    // всеми 20 попытками resume, каждая оставляла в списке загрузок Chrome
+    // оборванную мусорную запись с .json-именем.
+    const errorCode = delta.error && delta.error.current;
+    const permanentError = errorCode && PERMANENT_DL_ERRORS.has(errorCode);
+
+    if (permanentError || attempts > MAX_RESUME_ATTEMPTS) {
+        console.error(permanentError
+            ? 'постоянная ошибка загрузки (' + errorCode + '), resume не нужен:'
+            : 'превышен лимит resume для:', delta.id);
         downloadResumeAttempts.delete(delta.id);
         activeDownloadUrls.delete(dwd[0].url);
         const rec = await getRecordByDownloadUrl(dwd[0].url);
@@ -1112,6 +1163,12 @@ async function handleDownloadInterrupted(delta, dwd) {
             rec.s_status = 'timeout';
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
+        }
+        // v1.3.4: убираем оборванную запись из истории загрузок Chrome
+        try {
+            await chrome.downloads.erase({ id: delta.id });
+        } catch (e) {
+            log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e);
         }
         await persistRuntimeState();
         finishDownloadStep();
@@ -1254,13 +1311,11 @@ async function resumeProcessingIfNeeded() {
     // Шаг 2: реаттачим активные загрузки
     await reattachPendingDownloads();
 
-    // Шаг 3: чистим потерянные api-backoff alarms
+    // Шаг 3: чистим потерянные api-backoff alarms (v1.3.4: параллельно)
     const alarms = await chrome.alarms.getAll();
-    for (const a of alarms) {
-        if (a.name.startsWith(ALARM_API_BACKOFF_PREFIX)) {
-            await chrome.alarms.clear(a.name);
-        }
-    }
+    await Promise.all(alarms
+        .filter(a => a.name.startsWith(ALARM_API_BACKOFF_PREFIX))
+        .map(a => chrome.alarms.clear(a.name)));
 
     // Шаг 4: продолжаем обработку если не на паузе и не отменено
     if (is_cancelled) {
@@ -1522,6 +1577,32 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         if (pendingDownloadTimeouts.has(url)) {
             console.warn('таймаут загрузки (alarm):', url);
             pendingDownloadTimeouts.delete(url);
+            // v1.3.4: гасим зависшую загрузку и освобождаем слот concurrency.
+            // Раньше зависший in_progress-элемент навсегда оставался в
+            // chrome.downloads (в списке пользователя висели «0 Б/с» записи),
+            // а его url_fh навсегда занимал слот activeDownloadUrls — после
+            // MAX_CONCURRENT_DOWNLOADS таймаутов очередь вставала насмерть.
+            try {
+                const rec = await getRecord(url);
+                if (rec && rec.url_fh) {
+                    activeDownloadUrls.delete(rec.url_fh);
+                    const stalled = await chrome.downloads.search({
+                        url: rec.url_fh,
+                        state: 'in_progress',
+                    });
+                    for (const d of stalled) {
+                        downloadResumeAttempts.delete(d.id);
+                        try {
+                            await chrome.downloads.cancel(d.id);
+                        } catch (e) { /* уже неактивна */ }
+                        try {
+                            await chrome.downloads.erase({ id: d.id });
+                        } catch (e) { /* не критично */ }
+                    }
+                }
+            } catch (e) {
+                console.warn('таймаут: не удалось расчистить зависшие загрузки:', e);
+            }
             await persistRuntimeState();
             finishDownloadStep();
         }
@@ -1585,15 +1666,15 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
                 pendingDownloadTimeouts.clear();
                 activeDownloadUrls.clear();
                 _dlQueueCache = null;
+                _dlQueueUrls.clear(); // v1.3.4: синхронно с кэшем очереди
                 clearScheduleNext();
                 keepaliveActive = false;
                 {
+                    // v1.3.4: очистка alarms параллельно, а не по одному
                     const alarms = await chrome.alarms.getAll();
-                    for (const a of alarms) {
-                        if (a.name.startsWith('fsd_')) {
-                            await chrome.alarms.clear(a.name);
-                        }
-                    }
+                    await Promise.all(alarms
+                        .filter(a => a.name.startsWith('fsd_'))
+                        .map(a => chrome.alarms.clear(a.name)));
                 }
                 await clearAllState();
                 sendStatus();
