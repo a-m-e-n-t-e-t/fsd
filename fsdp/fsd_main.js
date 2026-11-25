@@ -183,6 +183,11 @@ const button_run = document.querySelector('.fsd_run');
 const button_pause = document.querySelector('.fsd_pause');
 const button_resume = document.querySelector('.fsd_resume');
 
+// v1.3.4: многострочные стили ставим один раз при загрузке, а не в каждом
+// сообщении a_status
+if (info) info.style.whiteSpace = 'pre-line';
+if (metricsEl) metricsEl.style.whiteSpace = 'pre-line';
+
 document.querySelector('.fsd_fix').addEventListener('click', async () => {
     const fileInput = document.querySelector('.fsd_fix_f');
     if (!fileInput) {
@@ -258,6 +263,9 @@ function renderLog() {
     // Последние 200 записей
     const slice = filtered.slice(-200);
     logBox.innerHTML = '';
+    // v1.3.4: строки собираются в DocumentFragment и вставляются одним
+    // appendChild — один reflow вместо сотен при каждой перерисовке лога
+    const frag = document.createDocumentFragment();
     for (const e of slice) {
         const line = document.createElement('div');
         line.className = 'log-line ' + e.level;
@@ -266,8 +274,9 @@ function renderLog() {
             '<span class="log-ts">[' + ts + ']</span>' +
             '<span class="log-src">' + escapeHtml(e.source) + '</span>' +
             escapeHtml(e.message);
-        logBox.appendChild(line);
+        frag.appendChild(line);
     }
+    logBox.appendChild(frag);
     // Скролл вниз
     logBox.scrollTop = logBox.scrollHeight;
 }
@@ -319,7 +328,6 @@ chrome.runtime.onMessage.addListener(function (mess) {
                 + '\nиндекс: ' + p.index_sl + ' из ' + p.arr_sl_len
                 + '\nактивных загрузок: ' + (p.active_downloads || 0)
                 + '\nв очереди загрузок: ' + (p.download_queue_len || 0);
-            info.style.whiteSpace = 'pre-line';
         }
         if (metricsEl) {
             metricsEl.textContent =
@@ -329,7 +337,6 @@ chrome.runtime.onMessage.addListener(function (mess) {
                 + '\nтаймаутов URL: ' + (p.total_urls_timeout || 0)
                 + '\nзавершено загрузок: ' + (p.total_downloads_completed || 0)
                 + '\nневалидных файлов: ' + (p.total_invalid_files || 0);
-            metricsEl.style.whiteSpace = 'pre-line';
         }
         if (progress_story) {
             progress_story.max = p.arr_sl_len;

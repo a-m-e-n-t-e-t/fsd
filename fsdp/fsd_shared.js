@@ -637,6 +637,9 @@ const ALLOWED_MIME_EXACT = [
     'application/x-mobipocket-ebook',
     'application/octet-stream',
 ];
+// v1.3.4: точное сравнение через Set — O(1) вместо линейного поиска
+// (вариант с суффиксом «; charset=...» проверяется линейно, он редкий)
+const ALLOWED_MIME_SET = new Set(ALLOWED_MIME_EXACT);
 
 export function validateDownloadedFile(downloadItem, settings, opts) {
     const s = settings || _settingsCache || SETTINGS_DEFAULTS;
@@ -660,7 +663,8 @@ export function validateDownloadedFile(downloadItem, settings, opts) {
                 : { valid: false, reason: 'html_instead_of_file', mime };
         }
         if (mime) {
-            const known = ALLOWED_MIME_EXACT.some(m => mime === m || mime.startsWith(m + ';'));
+            const known = ALLOWED_MIME_SET.has(mime)
+                || ALLOWED_MIME_EXACT.some(m => mime.startsWith(m + ';'));
             if (!known) {
                 return { valid: false, reason: 'unexpected_mime', mime };
             }
