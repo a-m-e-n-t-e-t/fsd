@@ -77,6 +77,9 @@ export class ChromeMock {
             _items: new Map(),
             _nextId: 0,
             _downloadCalls: [],
+            // v1.3.4: множество стёртых из истории id (search их больше не видит,
+            // но объекты остаются в _items — тесты могут проверить removeFile)
+            _erased: new Set(),
             // v1.3.3-тест: одноразовый MIME следующей завершённой загрузки
             // (по умолчанию 'application/zip' — как сервер fichub; тесты
             // Windows-сценария подменяют на 'application/x-zip-compressed')
@@ -106,7 +109,7 @@ export class ChromeMock {
                 queueMicrotask(() => callback(id));
             },
             async search(q) {
-                let arr = [...this._items.values()];
+                let arr = [...this._items.values()].filter(i => !this._erased.has(i.id));
                 if (q) {
                     if (q.id !== undefined) arr = arr.filter(i => i.id === q.id);
                     if (q.state) arr = arr.filter(i => i.state === q.state);
@@ -116,6 +119,20 @@ export class ChromeMock {
             },
             async removeFile(id) { const it = this._items.get(id); if (it) it.removed = true; },
             async cancel(id) { const it = this._items.get(id); if (it && it.state === 'in_progress') it.state = 'canceled'; },
+            // v1.3.4: как в Chrome — удаляет записи из истории (из search),
+            // объект в _items помечается и остаётся для проверок тестов
+            async erase(q) {
+                const erased = [];
+                for (const it of this._items.values()) {
+                    if (this._erased.has(it.id)) continue;
+                    if (q.id !== undefined && it.id !== q.id) continue;
+                    if (q.url && it.url !== q.url) continue;
+                    if (q.state && it.state !== q.state) continue;
+                    this._erased.add(it.id);
+                    erased.push(it.id);
+                }
+                return erased;
+            },
             async open() {},
             onChanged: {
                 addListener: (fn) => dlListeners.push(fn),
