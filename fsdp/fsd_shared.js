@@ -362,7 +362,9 @@ export const DEFAULT_METRICS = {
     sw_restarts: 0,
     last_sw_start: 0,
     total_urls_processed: 0,
+    // v1.3.5: ошибки разделены — таймауты (временные) и «файл не найден» (постоянные)
     total_urls_timeout: 0,
+    total_urls_not_found: 0,
     total_downloads_started: 0,
     total_downloads_completed: 0,
     total_downloads_interrupted: 0,

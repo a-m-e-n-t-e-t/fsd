@@ -335,6 +335,7 @@ chrome.runtime.onMessage.addListener(function (mess) {
                 + '\nпоследний запуск: ' + formatDateTime(p.last_sw_start)
                 + '\nобработано URL: ' + (p.total_urls_processed || 0)
                 + '\nтаймаутов URL: ' + (p.total_urls_timeout || 0)
+                + '\nфайл не найден: ' + (p.total_urls_not_found || 0)
                 + '\nзавершено загрузок: ' + (p.total_downloads_completed || 0)
                 + '\nневалидных файлов: ' + (p.total_invalid_files || 0);
         }

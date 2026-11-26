@@ -6,6 +6,8 @@
 //     и освобождает слот concurrency (раньше слот утекал навсегда)
 //  4. Fail-fast постоянных ошибок загрузки (SERVER_BAD_CONTENT) — без
 //     бессмысленных 20 попыток resume
+//  4b. Разделение ошибок v1.3.5: FILE_NOT_FOUND → not_found, а не timeout;
+//      метрики total_urls_timeout / total_urls_not_found считаются отдельно
 //  5. Невалидный файл: запись вычищается из истории загрузок Chrome
 //  6. fix(): батч-puts, нормализация ключей/дат, Set-фильтр arr_file_p
 'use strict';
@@ -238,6 +240,41 @@ await chromeMock.runtime.sendMessage({
     await shared.flushMetrics();
     const m = chromeMock.storage.local._raw('fsd_metrics');
     check('fail-fast: total_downloads_interrupted = 1', m.total_downloads_interrupted === 1);
+    // v1.3.5: SERVER_BAD_CONTENT — это таймаут-подобная сбойная ошибка, в not_found не попадает
+    check('разделение: SERVER_BAD_CONTENT → total_urls_timeout = 1', m.total_urls_timeout === 1);
+    check('разделение: SERVER_BAD_CONTENT → total_urls_not_found = 0', m.total_urls_not_found === 0);
+}
+
+// === 4b. Разделение ошибок: FILE_NOT_FOUND → not_found (v1.3.5) ===
+console.log('\n[4b] FILE_NOT_FOUND: метрика not_found, статус not_found');
+const KEY778 = 'https://www.fanfiction.net/s/778/';
+await chromeMock.runtime.sendMessage({
+    type_mess: 'add_url', fs: 2,
+    exp_rec: { url_s: 'https://www.fanfiction.net/s/778/1/Story', url_fh: 'https://fichub.net/cache/html/778zip', s_status: 'old', date_upd: '2026-09-01' },
+});
+{
+    const started = await waitFor('загрузка 778 стартовала', () => dl() === 6);
+    check('notfound: загрузка стартовала', started);
+    const dl778 = lastDlId();
+    blockAutoComplete(dl778);
+    const item = chromeMock.downloads._items.get(dl778);
+    item.state = 'interrupted';
+    chromeMock.downloads._fireChanged({
+        id: dl778,
+        state: { current: 'interrupted' },
+        error: { current: 'FILE_NOT_FOUND' },
+    });
+    await waitFor('запись 778 помечена not_found', async () => {
+        const r = await getRec(KEY778);
+        return !!(r && r.s_status === 'not_found');
+    });
+    const hasResumeAlarm = [...chromeMock.alarms._map.keys()]
+        .some(n => n.startsWith('fsd_resume_dl_'));
+    check('notfound: resume-alarm НЕ создан для FILE_NOT_FOUND', !hasResumeAlarm);
+    await shared.flushMetrics();
+    const m = chromeMock.storage.local._raw('fsd_metrics');
+    check('разделение: FILE_NOT_FOUND → total_urls_not_found = 1', m.total_urls_not_found === 1);
+    check('разделение: FILE_NOT_FOUND не растит total_urls_timeout', m.total_urls_timeout === 1);
 }
 
 // === 5. Невалидный файл: erase из истории загрузок ===
