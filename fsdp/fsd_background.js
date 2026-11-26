@@ -311,6 +311,7 @@ function sendStatus() {
                     last_sw_start: metrics.last_sw_start,
                     total_urls_processed: metrics.total_urls_processed,
                     total_urls_timeout: metrics.total_urls_timeout,
+                    total_urls_not_found: metrics.total_urls_not_found,
                     total_downloads_completed: metrics.total_downloads_completed,
                     total_invalid_files: metrics.total_invalid_files,
                 },
@@ -570,8 +571,11 @@ async function processUrl(url_s) {
                 file_p: '',
                 id_f: '',
             }, true);
+            // v1.3.5: разделение ошибок — таймауты и «файл не найден» считаются отдельно
             if (result.status === 'timeout') {
                 await updateMetrics(m => { m.total_urls_timeout++; return m; });
+            } else if (result.status === 'not_found') {
+                await updateMetrics(m => { m.total_urls_not_found++; return m; });
             }
         } else {
             await add_sl({
@@ -1151,19 +1155,27 @@ async function handleDownloadInterrupted(delta, dwd) {
     // оборванную мусорную запись с .json-именем.
     const errorCode = delta.error && delta.error.current;
     const permanentError = errorCode && PERMANENT_DL_ERRORS.has(errorCode);
+    // v1.3.5: FILE_NOT_FOUND — постоянная ошибка «файл не найден», а не таймаут
+    const notFoundError = errorCode === 'FILE_NOT_FOUND';
 
-    if (permanentError || attempts > MAX_RESUME_ATTEMPTS) {
-        console.error(permanentError
+    if (permanentError || notFoundError || attempts > MAX_RESUME_ATTEMPTS) {
+        console.error(permanentError || notFoundError
             ? 'постоянная ошибка загрузки (' + errorCode + '), resume не нужен:'
             : 'превышен лимит resume для:', delta.id);
         downloadResumeAttempts.delete(delta.id);
         activeDownloadUrls.delete(dwd[0].url);
         const rec = await getRecordByDownloadUrl(dwd[0].url);
         if (rec) {
-            rec.s_status = 'timeout';
+            rec.s_status = notFoundError ? 'not_found' : 'timeout';
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
         }
+        // v1.3.5: метрики ошибок разделены
+        await updateMetrics(m => {
+            if (notFoundError) m.total_urls_not_found++;
+            else m.total_urls_timeout++;
+            return m;
+        });
         // v1.3.4: убираем оборванную запись из истории загрузок Chrome
         try {
             await chrome.downloads.erase({ id: delta.id });
