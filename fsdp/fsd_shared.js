@@ -164,10 +164,19 @@ export function buildFileName(url_s) {
     return prefix + parts[4];
 }
 
+// v1.3.6: статус 'old' восстанавливается и для записей со СБРОШЕННЫМ
+// статусом ('' / 'timeout' / 'not_found'), если дата обновления старше 5 лет.
+// Раньше old присваивался только при сохранённом 'ongoing'; после ошибок или
+// миграций старые незакрытые истории теряли статус и не попадали ни в одну
+// выборку. Теперь они снова получают 'old' и участвуют в проверке/загрузке.
+// ВАЖНО: resolveStatus НЕ должен применяться к данным, пришедшим из API
+// (processUrl) — иначе давняя история со статусом 'completed' молча
+// превратилась бы в 'old'. Для записей из локальной БД (add_sl/fix) — ок:
+// серверный статус там уже отражён в date_upd.
 export function resolveStatus(s_status, date_upd) {
-    if (s_status === 'ongoing') {
+    if (s_status === 'ongoing' || s_status === '' || s_status === 'timeout' || s_status === 'not_found') {
         const parsed = parseDate(date_upd);
-        if ((Date.now() - Number(parsed)) > FIVE_YEARS_MS)
+        if (Number(parsed) !== 0 && (Date.now() - Number(parsed)) > FIVE_YEARS_MS)
             return 'old';
     }
     return s_status;
