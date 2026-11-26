@@ -1,103 +1,40 @@
 'use strict';
 import {
-    FICHUB_HOST,
-    STORE_NAME,
-    MAX_RESUME_ATTEMPTS,
-    FIVE_YEARS_MS,
-    t_rec_sl,
-    t_monitor,
-    parseDate,
-    normalize,
-    buildFileName,
-    resolveStatus,
-    getDB,
-    saveMonitorState,
-    loadMonitorState,
-    saveQueueArr,
-    saveRuntimeState,
-    loadRuntimeState,
-    saveFetchState,
-    loadFetchState,
-    clearAllFetchStates,
-    saveDownloadQueue,
-    loadDownloadQueue,
-    clearDownloadQueue,
-    loadMetrics,
-    updateMetrics,
-    saveMetrics,
-    flushMetrics,
-    DEFAULT_METRICS,
-    clearAllState,
-    loadSettings,
-    getCachedSettings,
-    refreshSettingsCache,
-    saveSettings,
-    log,
-    flushLog,
-    clearLog,
+    FICHUB_HOST, STORE_NAME, MAX_RESUME_ATTEMPTS, FIVE_YEARS_MS,
+    t_rec_sl, t_monitor, parseDate, normalize, buildFileName,
+    resolveStatus, computeNeedUpd, getDB, saveMonitorState, loadMonitorState,
+    saveQueueArr, saveRuntimeState, loadRuntimeState, saveFetchState,
+    loadFetchState, clearAllFetchStates, saveDownloadQueue, loadDownloadQueue,
+    clearDownloadQueue, loadMetrics, updateMetrics, saveMetrics, flushMetrics,
+    DEFAULT_METRICS, clearAllState, loadSettings, getCachedSettings,
+    refreshSettingsCache, saveSettings, log, flushLog, clearLog,
     validateDownloadedFile,
 } from './fsd_shared.js';
 
-// ============================================================================
-// КОНСТАНТЫ
-// Все длительности и лимиты берём из settings (с дефолтами).
-// Глобальные геттеры используют кэш, который обновляется при изменении settings.
-// ============================================================================
 function S() { return getCachedSettings(); }
 
-// Константы (не настраиваемые — структурные)
 const STATUS_BATCH = 100;
-// v1.3.2: 'invalid' убран — записи с невалидным файлом больше не попадают
-// в очередь при каждой проверке (вечная перекачка). Реанимация старых
-// 'invalid'-записей — разовая миграция resetInvalidStatuses() при обновлении.
-// v1.3.6: восстановлен статус 'old' — старые незакрытые истории (ongoing,
-// дата обновления старше 5 лет) снова участвуют в выборках «проверить все»
-// и авто-проверки.
-const NEEDS_UPDATE_STATUSES = new Set(['ongoing', 'old', 'timeout', 'not_found', '']);
-const PATH_SEPARATOR_REGEX = /[/\\]/;
-const CLEAN_NUMBER_SUFFIX_REGEX = /\s*\(\d+\)/g;
-
+const PATH_SEPARATOR_REGEX = /[\/\\]/;
+const CLEAN_NUMBER_SUFFIX_REGEX = /\s*(\d+)/g;
 const FICHUB_API_BASE = 'https://fichub.net/api/v0/epub?q=';
 const API_MAX_RETRIES = 60;
 const API_DEFAULT_RETRY_DELAY_SEC = 5;
 const API_NETWORK_ERROR_DELAY_MS = 5000;
-// v1.3.2: таймаут одного запроса к API — зависший fetch раньше держал
-// обработку URL до срабатывания STUCK- watchdog'а (5 минут)
 const API_FETCH_TIMEOUT_MS = 60 * 1000;
-// v1.3.1: постоянные клиентские ошибки — ретраи бессмысленны (fail-fast)
 const API_FATAL_STATUSES = new Set([400, 401, 403, 404, 405, 410]);
-// v1.3.4: постоянные ошибки загрузок Chrome — повторный запуск бессмысленен.
-// SERVER_BAD_CONTENT — fichub отдал 4xx вместо файла (кэш регенерируется);
-// USER_CANCELED — пользователь сам отменил загрузку, не воюем с ним.
-// Сетевые/файловые сбои (NETWORK_*, FILE_*) остаются ретраимыми.
-const PERMANENT_DL_ERRORS = new Set([
-    'SERVER_BAD_CONTENT',
-    'SERVER_FAILED',
-    'SERVER_UNAUTHORIZED',
-    'SERVER_CERT_PROBLEM',
-    'SERVER_FORBIDDEN',
-    'USER_CANCELED',
-]);
-const DATE_REGEX = /Updated:\s*(?:<[^>]+>)*(\d{4}-\d{2}-\d{2})/;
+const PERMANENT_DL_ERRORS = new Set(['SERVER_BAD_CONTENT', 'SERVER_FAILED', 'SERVER_UNAUTHORIZED', 'SERVER_CERT_PROBLEM', 'SERVER_FORBIDDEN', 'USER_CANCELED']);
+const DATE_REGEX = /Updated:\s*(?:<[^>]+>)\s*(\d{4}-\d{2}-\d{2})/;
 const STATUS_REGEX = /Status:\s*(?:<[^>]+>)*([^<\r\n]+)/i;
-
 const STUCK_PROCESSING_THRESHOLD_MS = 5 * 60 * 1000;
 
-// Имена chrome.alarms
 const ALARM_KEEPALIVE = 'fsd_keepalive';
 const ALARM_PROCESS_NEXT = 'fsd_process_next';
 const ALARM_DOWNLOAD_TIMEOUT_PREFIX = 'fsd_dl_timeout_';
 const ALARM_API_BACKOFF_PREFIX = 'fsd_api_backoff_';
 const ALARM_RESUME_DL_PREFIX = 'fsd_resume_dl_';
 const ALARM_AUTO_CHECK = 'fsd_auto_check';
-// v1.3.1: ALARM_DOWNLOAD_QUEUE удалён — alarm с таким именем никогда не создавался (мёртвый код)
+const ALARM_MIN_DELAY_MS = 30000; // v1.3.7: поднят до 30с для соответствия минимуму Chrome
 
-const ALARM_MIN_DELAY_MS = 25000;
-// KEEPALIVE_PERIOD_MIN берётся из settings через S().KEEPALIVE_PERIOD_MIN
-
-// ============================================================================
-// СОСТОЯНИЕ
-// ============================================================================
 let fsd_monitor = new t_monitor();
 let is_processing = false;
 let is_cancelled = false;
@@ -105,32 +42,17 @@ let pending_process_next = false;
 let nextTimeoutId = null;
 let currentlyProcessingUrl = null;
 let currentlyProcessingStartedAt = 0;
-let processAlarmActive = false;   // v1.3.1: backup-alarm создаётся один раз на сессию
-let keepaliveActive = false;      // v1.3.1: keepalive только при активной работе
-
-const downloadResumeAttempts = new Map();   // downloadId → attempts
-const pendingDownloadTimeouts = new Set(); // normalizedUrl
-const activeDownloadUrls = new Set();      // url_fh — для лимита concurrency
-
-let _dlQueueCache = null; // v1.3.1: кэш download-очереди в памяти
-// v1.3.4: множество url_s в очереди — дедуп за O(1) вместо O(n) some()
-// (при большом импорте и медленных загрузках очередь растёт до тысяч
-// элементов, и квадратичный поиск тормозил каждый enqueue)
+let processAlarmActive = false;
+let keepaliveActive = false;
+const downloadResumeAttempts = new Map();
+const pendingDownloadTimeouts = new Set();
+const activeDownloadUrls = new Set();
+let _dlQueueCache = null;
 let _dlQueueUrls = new Set();
 
-// ============================================================================
-// ХЕЛПЕРЫ
-// ============================================================================
-function shortDelay(ms) {
-    return new Promise(r => setTimeout(r, ms));
-}
+function shortDelay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// v1.3.4: один общий onAlarm-листенер на все ожидания alarm'ов вместо
-// временного листенера на каждую задержку. Старый вариант протекал:
-// если alarm не срабатывал (например, 'stop' вычищает все fsd_* alarms),
-// листенер оставался висеть до смерти SW. Имена alarm'ов уникальны
-// (счётчик попыток / random-суффикс), перезаписи ожиданий в Map нет.
-const pendingAlarmWaits = new Map(); // alarmName → resolve
+const pendingAlarmWaits = new Map();
 chrome.alarms.onAlarm.addListener((alarm) => {
     const resolve = pendingAlarmWaits.get(alarm.name);
     if (resolve) {
@@ -142,9 +64,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function alarmDelay(name, delayMs) {
     return new Promise((resolve) => {
         pendingAlarmWaits.set(name, resolve);
-        chrome.alarms.create(name, {
-            delayInMinutes: Math.max(delayMs / 60000, 0.5),
-        });
+        chrome.alarms.create(name, { delayInMinutes: Math.max(delayMs / 60000, 0.5) });
     });
 }
 
@@ -154,22 +74,15 @@ async function smartDelay(delayMs, alarmName) {
         return { kind: 'timeout' };
     }
     if (is_cancelled) return { kind: 'cancelled' };
-    if (!alarmName) {
-        alarmName = ALARM_API_BACKOFF_PREFIX + Math.random().toString(36).slice(2);
-    }
+    if (!alarmName) alarmName = ALARM_API_BACKOFF_PREFIX + Math.random().toString(36).slice(2);
     await alarmDelay(alarmName, delayMs);
+    if (is_cancelled) return { kind: 'cancelled' };
     return { kind: 'alarm', name: alarmName };
 }
 
-// ============================================================================
-// PERSIST / RESTORE СОСТОЯНИЯ
-// ============================================================================
 async function persistRuntimeState() {
     const state = {
-        is_processing,
-        is_cancelled,
-        pending_process_next,
-        currentlyProcessingUrl,
+        is_processing, is_cancelled, pending_process_next, currentlyProcessingUrl,
         currentlyProcessingStartedAt,
         downloadResumeAttempts: Array.from(downloadResumeAttempts.entries()),
         pendingDownloadTimeouts: Array.from(pendingDownloadTimeouts),
@@ -182,32 +95,22 @@ async function persistRuntimeState() {
 async function restoreRuntimeState() {
     const state = await loadRuntimeState();
     if (!state) return;
-
     is_processing = !!state.is_processing;
     is_cancelled = !!state.is_cancelled;
     pending_process_next = !!state.pending_process_next;
     currentlyProcessingUrl = state.currentlyProcessingUrl || null;
     currentlyProcessingStartedAt = state.currentlyProcessingStartedAt || 0;
-
     downloadResumeAttempts.clear();
     if (Array.isArray(state.downloadResumeAttempts)) {
-        for (const [k, v] of state.downloadResumeAttempts) {
-            downloadResumeAttempts.set(k, v);
-        }
+        for (const [k, v] of state.downloadResumeAttempts) downloadResumeAttempts.set(k, v);
     }
-
     pendingDownloadTimeouts.clear();
     if (Array.isArray(state.pendingDownloadTimeouts)) {
-        for (const url of state.pendingDownloadTimeouts) {
-            pendingDownloadTimeouts.add(url);
-        }
+        for (const url of state.pendingDownloadTimeouts) pendingDownloadTimeouts.add(url);
     }
-
     activeDownloadUrls.clear();
     if (Array.isArray(state.activeDownloadUrls)) {
-        for (const url of state.activeDownloadUrls) {
-            activeDownloadUrls.add(url);
-        }
+        for (const url of state.activeDownloadUrls) activeDownloadUrls.add(url);
     }
 }
 
@@ -215,29 +118,16 @@ async function restoreAllState() {
     const saved = await loadMonitorState();
     if (saved) {
         fsd_monitor = t_monitor.fromJSON(saved);
-        console.log('состояние восстановлено, index_sl:', fsd_monitor.index_sl,
-            'arr_sl.length:', fsd_monitor.arr_sl.length,
-            'fsd_status:', fsd_monitor.fsd_status,
-            'is_paused:', fsd_monitor.is_paused);
+        console.log('состояние восстановлено, index_sl:', fsd_monitor.index_sl, 'arr_sl.length:', fsd_monitor.arr_sl.length, 'fsd_status:', fsd_monitor.fsd_status, 'is_paused:', fsd_monitor.is_paused);
     }
     await restoreRuntimeState();
-    console.log('runtime-состояние восстановлено: is_processing=', is_processing,
-        'is_cancelled=', is_cancelled,
-        'currentlyProcessingUrl=', currentlyProcessingUrl,
-        'pendingDownloadTimeouts=', pendingDownloadTimeouts.size,
-        'activeDownloadUrls=', activeDownloadUrls.size);
 }
 
-// v1.3.1: пишет только компактные поля монитора (без arr_sl) + runtime.
-// Очередь пишется отдельно через saveQueueArr при построении.
 async function persistAllState() {
     await saveMonitorState(fsd_monitor);
     await persistRuntimeState();
 }
 
-// ============================================================================
-// WATCHDOG ЗАГРУЗОК ЧЕРЕЗ chrome.alarms
-// ============================================================================
 async function startDownloadTimeout(url_s) {
     const normalizedUrl = normalize(url_s);
     if (!normalizedUrl) return;
@@ -245,9 +135,7 @@ async function startDownloadTimeout(url_s) {
         await chrome.alarms.clear(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl);
     }
     pendingDownloadTimeouts.add(normalizedUrl);
-    await chrome.alarms.create(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl, {
-        delayInMinutes: S().DOWNLOAD_TIMEOUT_MS / 60000,
-    });
+    await chrome.alarms.create(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl, { delayInMinutes: S().DOWNLOAD_TIMEOUT_MS / 60000 });
 }
 
 async function closePendingDownload(url_s) {
@@ -257,41 +145,25 @@ async function closePendingDownload(url_s) {
     await chrome.alarms.clear(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl);
 }
 
-// ============================================================================
-// DB ХЕЛПЕРЫ
-// ============================================================================
-// v1.3.1: date_upd всегда пишем ISO-строкой. Раньше в сторе лежали и Date,
-// и строки — индекс by_date_upd сортировал их вперемешку по типам.
 async function putRecord(rec) {
-    if (rec && rec.date_upd instanceof Date) {
-        rec.date_upd = rec.date_upd.toISOString();
-    }
+    if (rec && rec.date_upd instanceof Date) rec.date_upd = rec.date_upd.toISOString();
     const db = await getDB();
     await db.put(STORE_NAME, rec);
 }
-
 async function getRecord(url_s) {
     if (!url_s || typeof url_s !== 'string') return new t_rec_sl();
     const db = await getDB();
     return (await db.get(STORE_NAME, url_s)) || new t_rec_sl();
 }
-
 async function getRecordByDownloadUrl(url_fh) {
     const db = await getDB();
     return await db.getFromIndex(STORE_NAME, 'by_url_fh', url_fh);
 }
-
 async function countRecord() {
     const db = await getDB();
     return await db.count(STORE_NAME);
 }
 
-// ============================================================================
-// ОТПРАВКА СТАТУСА В UI
-// v1.3.1: БЕЗ persistAllState — состояние пишется явно в местах изменения,
-// а не при каждом показе статуса (раньше каждое сообщение UI переписывало
-// весь монитор вместе с очередью).
-// ============================================================================
 function sendStatus() {
     (async () => {
         try {
@@ -300,54 +172,40 @@ function sendStatus() {
             chrome.runtime.sendMessage({
                 type_mess: 'a_status',
                 statusPayload: {
-                    arr_sl_len: fsd_monitor.arr_sl.length,
-                    arr_tab_len: 0,
-                    index_sl: fsd_monitor.index_sl,
-                    c_u_s: fsd_monitor.c_u_s,
-                    c_e_s: fsd_monitor.c_e_s,
-                    fsd_status: fsd_monitor.fsd_status,
-                    url_op: fsd_monitor.url_op,
-                    s_c: fsd_monitor.s_c,
-                    is_paused: fsd_monitor.is_paused,
-                    active_downloads: activeDownloadUrls.size,
-                    download_queue_len: downloadQueue.length,
-                    sw_restarts: metrics.sw_restarts,
-                    last_sw_start: metrics.last_sw_start,
-                    total_urls_processed: metrics.total_urls_processed,
-                    total_urls_timeout: metrics.total_urls_timeout,
-                    total_urls_not_found: metrics.total_urls_not_found,
-                    total_downloads_completed: metrics.total_downloads_completed,
+                    arr_sl_len: fsd_monitor.arr_sl.length, arr_tab_len: 0, index_sl: fsd_monitor.index_sl,
+                    c_u_s: fsd_monitor.c_u_s, c_e_s: fsd_monitor.c_e_s, fsd_status: fsd_monitor.fsd_status,
+                    url_op: fsd_monitor.url_op, s_c: fsd_monitor.s_c, is_paused: fsd_monitor.is_paused,
+                    active_downloads: activeDownloadUrls.size, download_queue_len: downloadQueue.length,
+                    sw_restarts: metrics.sw_restarts, last_sw_start: metrics.last_sw_start,
+                    total_urls_processed: metrics.total_urls_processed, total_urls_timeout: metrics.total_urls_timeout,
+                    total_urls_not_found: metrics.total_urls_not_found, total_downloads_completed: metrics.total_downloads_completed,
                     total_invalid_files: metrics.total_invalid_files,
                 },
             }).catch(() => {});
-        } catch (e) {
-            console.warn('sendStatus error:', e);
-        }
+        } catch (e) { console.warn('sendStatus error:', e); }
     })();
     manageKeepalive();
 }
 
-// ============================================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ЗАПИСЕЙ
-// ============================================================================
-function audit_fields(v) {
-    if (v === undefined || v === null) return '';
-    return v;
-}
+function audit_fields(v) { if (v === undefined || v === null) return ''; return v; }
+const RECORD_FIELDS = ['url_s', 'name', 's_status', 'date_upd', 'url_fh', 'file_p', 'id_f', 'hash_f', 'need_upd'];
 
-const RECORD_FIELDS = ['url_s', 'name', 's_status', 'date_upd', 'url_fh', 'file_p', 'id_f', 'hash_f'];
 function recordsDiffer(a, b) {
     return RECORD_FIELDS.some(f => a[f] !== b[f]);
 }
 
-// v1.3.1: ИСПРАВЛЕНА СИНТАКСИЧЕСКАЯ ОШИБКА, из-за которой весь SW не грузился:
-// было `url= url.split('?').[0];` → SyntaxError: Unexpected token '['
 function fixUrl(url) {
     if (!url || typeof url !== 'string') return '';
     url = url.split('?')[0];
-    if (url.startsWith('http://') || url.startsWith('https://')) return url;
-    if (url.startsWith('/')) return 'https://fichub.net' + url;
-    return 'https://fichub.net/' + url;
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname !== FICHUB_HOST) return ''; // v1.3.7: защита от произвольных доменов
+            return url;
+        } catch (e) { return ''; }
+    }
+    if (url.startsWith('/')) return 'https://' + FICHUB_HOST + url;
+    return 'https://' + FICHUB_HOST + '/' + url;
 }
 
 function extractUrls(res) {
@@ -359,43 +217,23 @@ function extractUrls(res) {
     if (!res.urls) return urls;
     const types = ['epub', 'html', 'mobi', 'pdf'];
     for (let i = 0; i < types.length; ++i) {
-        if (res.urls[types[i]]) {
-            urls[types[i]] = fixUrl(res.urls[types[i]]);
-        }
+        if (res.urls[types[i]]) urls[types[i]] = fixUrl(res.urls[types[i]]);
     }
     return urls;
 }
 
-// ============================================================================
-// STATE MACHINE ДЛЯ fetchEpubApi
-// Состояние шага сохраняется в storage, чтобы после restart SW продолжить
-// с того же места. v1.3.1: стейт пишется только при ИЗМЕНЕНИИ (раньше —
-// в начале каждой итерации, даже без изменений).
-// ============================================================================
 async function fetchEpubApi(url_s) {
     let state = await loadFetchState(url_s);
     if (!state) {
-        state = {
-            attempt: 0,
-            backoff_429_ms: S().API_429_BASE_DELAY_MS,
-            started_at: Date.now(),
-        };
+        state = { attempt: 0, backoff_429_ms: S().API_429_BASE_DELAY_MS, started_at: Date.now() };
     } else {
-        console.log('fetchEpubApi: возобновление с попытки', state.attempt,
-            'для', url_s, '(backoff_429 =', state.backoff_429_ms, 'мс)');
+        console.log('fetchEpubApi: возобновление с попытки', state.attempt, 'для', url_s, '(backoff_429 =', state.backoff_429_ms, 'мс)');
     }
-
     while (state.attempt < API_MAX_RETRIES) {
-        if (is_cancelled) {
-            await saveFetchState(url_s, null);
-            return { ok: false, status: 'cancelled' };
-        }
-
+        if (is_cancelled) { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
         let resp;
         try {
-            resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s), {
-                signal: AbortSignal.timeout(API_FETCH_TIMEOUT_MS),
-            });
+            resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s), { signal: AbortSignal.timeout(API_FETCH_TIMEOUT_MS) });
         } catch (e) {
             console.warn('fetchEpubApi: сетевая ошибка, попытка', state.attempt + 1, e);
             state.attempt++;
@@ -403,40 +241,24 @@ async function fetchEpubApi(url_s) {
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
             continue;
         }
-
         if (resp.status === 429) {
             await updateMetrics(m => { m.total_429_received++; return m; });
-
             const retryAfterHeader = resp.headers.get('Retry-After');
-            let delayMs;
-            if (retryAfterHeader) {
-                delayMs = (Number(retryAfterHeader) * 1000) || state.backoff_429_ms;
-            } else {
-                delayMs = state.backoff_429_ms;
-            }
-            console.warn('fetchEpubApi: HTTP 429, ждём', (delayMs / 1000).toFixed(1),
-                'сек, попытка', state.attempt + 1);
-
-            if (is_cancelled) {
-                await saveFetchState(url_s, null);
-                return { ok: false, status: 'cancelled' };
-            }
-            // Сохраняем state ДО задержки — если SW умрёт, при restart продолжим
+            let delayMs = retryAfterHeader ? (Number(retryAfterHeader) * 1000) || state.backoff_429_ms : state.backoff_429_ms;
+            console.warn('fetchEpubApi: HTTP 429, ждём', (delayMs / 1000).toFixed(1), 'сек, попытка', state.attempt + 1);
+            if (is_cancelled) { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
             state.attempt++;
             state.backoff_429_ms = Math.min(state.backoff_429_ms * 2, S().API_429_MAX_DELAY_MS);
             await saveFetchState(url_s, state);
-            await smartDelay(delayMs, ALARM_API_BACKOFF_PREFIX + '429_' + state.attempt);
+            const delayRes = await smartDelay(delayMs, ALARM_API_BACKOFF_PREFIX + '429_' + state.attempt);
+            if (delayRes.kind === 'cancelled') { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
             continue;
         }
-
-        // v1.3.1: постоянные клиентские ошибки не ретраим (раньше 404 мучил
-        // сервер 60 попыток × 5 сек)
         if (API_FATAL_STATUSES.has(resp.status)) {
             console.warn('fetchEpubApi: HTTP', resp.status, '— постоянная ошибка, ретраи не нужны');
             await saveFetchState(url_s, null);
             return { ok: false, status: 'not_found' };
         }
-
         if (!resp.ok) {
             console.warn('fetchEpubApi: HTTP', resp.status, 'попытка', state.attempt + 1);
             state.attempt++;
@@ -444,18 +266,14 @@ async function fetchEpubApi(url_s) {
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
             continue;
         }
-
         let res;
-        try {
-            res = await resp.json();
-        } catch (e) {
+        try { res = await resp.json(); } catch (e) {
             console.warn('fetchEpubApi: ответ не JSON, попытка', state.attempt + 1);
             state.attempt++;
             await saveFetchState(url_s, state);
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
             continue;
         }
-
         if (!res) {
             console.warn('fetchEpubApi: пустой ответ');
             state.attempt++;
@@ -463,49 +281,35 @@ async function fetchEpubApi(url_s) {
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
             continue;
         }
-
         if ('retry_after' in res) {
             const delaySec = Number(res.retry_after) || API_DEFAULT_RETRY_DELAY_SEC;
-            console.log('fetchEpubApi: retry_after', delaySec,
-                'сек, попытка', state.attempt + 1, 'error:', res.error || res.err || 0);
-            if (is_cancelled) {
-                await saveFetchState(url_s, null);
-                return { ok: false, status: 'cancelled' };
-            }
+            console.log('fetchEpubApi: retry_after', delaySec, 'сек, попытка', state.attempt + 1, 'error:', res.error || res.err || 0);
+            if (is_cancelled) { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
             state.attempt++;
             await saveFetchState(url_s, state);
-            await smartDelay(delaySec * 1000, ALARM_API_BACKOFF_PREFIX + 'retry_' + state.attempt);
+            const delayRes2 = await smartDelay(delaySec * 1000, ALARM_API_BACKOFF_PREFIX + 'retry_' + state.attempt);
+            if (delayRes2.kind === 'cancelled') { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
             continue;
         }
-
         const hasError = ('error' in res && res.error != 0) || ('err' in res && res.err != 0);
         if (hasError) {
             const upstreamFail = res.upstream === true;
             const status = upstreamFail ? 'timeout' : 'not_found';
-            console.warn('fetchEpubApi: ошибка', res.msg || res.error,
-                '| upstream:', upstreamFail, '| ret:', res.ret, '→', status);
+            console.warn('fetchEpubApi: ошибка', res.msg || res.error, '| upstream:', upstreamFail, '| ret:', res.ret, '→', status);
             await saveFetchState(url_s, null);
             return { ok: false, status, res };
         }
-
         const urls = extractUrls(res);
         if (Object.keys(urls).length > 0) {
-            // v1.3.1: берём структурированные meta из ответа API вместо
-            // regex-парсинга текста info (fallback на regex оставлен для
-            // старых ответов без meta)
             let s_status = '';
             let r_date = new Date(0);
-
             if (res.meta) {
-                if (typeof res.meta.status === 'string' && res.meta.status.trim() !== '') {
-                    s_status = res.meta.status.trim();
-                }
+                if (typeof res.meta.status === 'string' && res.meta.status.trim() !== '') s_status = res.meta.status.trim();
                 if (res.meta.updated) {
                     const d = parseDate(res.meta.updated);
                     if (d.getTime() !== 0) r_date = d;
                 }
             }
-
             if (s_status === '' && r_date.getTime() === 0) {
                 const infoText = res.info || '';
                 const m = infoText.match(DATE_REGEX);
@@ -516,96 +320,63 @@ async function fetchEpubApi(url_s) {
                     }
                 }
                 const m2 = infoText.match(STATUS_REGEX);
-                if (m2 && m2[1]) {
-                    s_status = m2[1].replace(/<[^>]+>/g, '').trim();
-                }
+                if (m2 && m2[1]) s_status = m2[1].replace(/<[^>]+>/g, '').trim();
             }
-
-            // v1.3.2: hash из ответа API (проверено: равен md5 сгенерированного
-            // файла). url_fh после fixUrl не содержит ?h=/eh= и не меняется,
-            // поэтому hash — единственный детектор изменений при той же дате/url.
-            // v1.3.3: при регенерации серверного кэша md5 меняется без изменения
-            // контента — перекачка по hash ограничена (см. add_sl)
             const hash_f = (res.hashes && (res.hashes.epub || res.hashes.html)) || '';
             console.log('fetchEpubApi: успех, url_fh =', urls.html || urls.epub);
             await saveFetchState(url_s, null);
-            return {
-                ok: true,
-                url_fh: urls.html || urls.epub || '',
-                urls,
-                s_status,
-                date_upd: r_date.toISOString(),
-                hash_f,
-            };
+            return { ok: true, url_fh: urls.html || urls.epub || '', urls, s_status, date_upd: r_date.toISOString(), hash_f };
         }
-
         console.log('fetchEpubApi: нет ссылок, попытка', state.attempt + 1);
         state.attempt++;
         await saveFetchState(url_s, state);
         await shortDelay(S().API_REQUEST_DELAY_MS);
     }
-
     await saveFetchState(url_s, null);
     return { ok: false, status: 'timeout' };
 }
 
-// ============================================================================
-// ОБРАБОТКА ОДНОГО URL
-// ============================================================================
+// v1.3.7: хелпер для пометки ошибки без затирания даты и статуса
+async function markErrorRecord(url_s, isNotFound) {
+    const db = await getDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    let rec = await tx.store.get(url_s);
+    if (!rec) {
+        rec = new t_rec_sl();
+        rec.url_s = normalize(url_s);
+    }
+    rec.need_upd = true;
+    if (isNotFound) rec.s_status = 'not_found';
+    await tx.store.put(rec);
+    await tx.done;
+}
+
 async function processUrl(url_s) {
     currentlyProcessingUrl = url_s;
     currentlyProcessingStartedAt = Date.now();
     await persistRuntimeState();
-
     fsd_monitor.url_op = url_s;
     sendStatus();
-
     try {
         const result = await fetchEpubApi(url_s);
-
         if (is_cancelled) return;
-
         if (!result.ok) {
-            fsd_monitor.c_e_s++; // v1.3.1: счётчик ошибок снова осмысленный
-            await add_sl({
-                url_s: url_s,
-                url_fh: '',
-                s_status: result.status,
-                date_upd: new Date(0).toISOString(),
-                file_p: '',
-                id_f: '',
-            }, true);
-            // v1.3.5: разделение ошибок — таймауты и «файл не найден» считаются отдельно
-            if (result.status === 'timeout') {
-                await updateMetrics(m => { m.total_urls_timeout++; return m; });
-            } else if (result.status === 'not_found') {
-                await updateMetrics(m => { m.total_urls_not_found++; return m; });
-            }
+            fsd_monitor.c_e_s++;
+            await markErrorRecord(url_s, result.status === 'not_found');
+            if (result.status === 'timeout') await updateMetrics(m => { m.total_urls_timeout++; return m; });
+            else if (result.status === 'not_found') await updateMetrics(m => { m.total_urls_not_found++; return m; });
         } else {
-            // v1.3.6: статус из API записываем как есть (noStatusResolve) —
-            // resolveStatus вернул бы 'old' для давней 'completed', подменив
-            // настоящий серверный статус. 'old' локальным записям назначает
-            // миграция restoreOldStatuses() / fix().
             await add_sl({
-                url_s: url_s,
-                url_fh: result.url_fh,
-                s_status: result.s_status,
-                date_upd: result.date_upd,
-                file_p: '',
-                id_f: '',
-                hash_f: result.hash_f || '',
-            }, false, true); // noDownload=false, noStatusResolve=true (v1.3.6)
+                url_s: url_s, url_fh: result.url_fh, s_status: result.s_status,
+                date_upd: result.date_upd, file_p: '', id_f: '', hash_f: result.hash_f || '',
+            }, false, true);
         }
-
         await updateMetrics(m => {
             m.total_urls_processed++;
-            const dur = currentlyProcessingStartedAt
-                ? (Date.now() - currentlyProcessingStartedAt) : 0;
+            const dur = currentlyProcessingStartedAt ? (Date.now() - currentlyProcessingStartedAt) : 0;
             m.processing_time_ms_total += dur;
             m.processing_count++;
-            if (!Array.isArray(m.recent_processing_times_ms)) {
-                m.recent_processing_times_ms = [];
-            }
+            if (!Array.isArray(m.recent_processing_times_ms)) m.recent_processing_times_ms = [];
             m.recent_processing_times_ms.push(dur);
             return m;
         });
@@ -613,43 +384,26 @@ async function processUrl(url_s) {
         if (is_cancelled) return;
         console.error('processUrl error:', e);
         fsd_monitor.c_e_s++;
-        await add_sl({
-            url_s: url_s,
-            url_fh: '',
-            s_status: 'timeout',
-            date_upd: new Date(0).toISOString(),
-            file_p: '',
-            id_f: '',
-        }, true);
+        await markErrorRecord(url_s, false);
         await updateMetrics(m => { m.total_urls_timeout++; return m; });
     }
-
     currentlyProcessingUrl = null;
     currentlyProcessingStartedAt = 0;
     await persistRuntimeState();
-
-    if (fsd_monitor.flag_dwd) {
-        return; // ждём завершения загрузки
-    }
+    if (fsd_monitor.flag_dwd) return;
     await shortDelay(S().API_REQUEST_DELAY_MS);
     scheduleNext();
 }
 
-// ============================================================================
-// fix() — нормализация всех записей в БД
-// ============================================================================
 async function fix(arr_file_p = []) {
     const db = await getDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
-    const keyChanges = [];
-    const fieldChanges = [];
+    const keyChanges = [], fieldChanges = [];
     let del_file_p = 0;
     const filePCounts = new Map();
     const entries = [];
-    // v1.3.4: список файлов пользователя в Set — O(1) на запись вместо O(n)
-    // (на аудите большой БД со списком из сотен файлов экономит тысячи сравнений)
     const arrFilePSet = arr_file_p.length > 0 ? new Set(arr_file_p) : null;
-
+    
     for await (const cursor of tx.store) {
         if (!cursor.value) continue;
         const original = cursor.value;
@@ -660,7 +414,6 @@ async function fix(arr_file_p = []) {
         record_sl.name = audit_fields(original.name);
         const s_name = buildFileName(record_sl.url_s);
         if (record_sl.name !== s_name) record_sl.name = s_name;
-        // v1.3.1: нормализуем дату в ISO-строку (единый формат в индексе)
         record_sl.date_upd = parseDate(original.date_upd).toISOString();
         record_sl.s_status = resolveStatus(audit_fields(original.s_status), record_sl.date_upd);
         record_sl.url_fh = audit_fields(original.url_fh);
@@ -678,32 +431,24 @@ async function fix(arr_file_p = []) {
         const cleanedName = record_sl.file_p.replace(CLEAN_NUMBER_SUFFIX_REGEX, '');
         if (cleanedName !== record_sl.file_p) record_sl.file_p = cleanedName;
         record_sl.id_f = original.id_f || '';
-        record_sl.hash_f = audit_fields(original.hash_f); // v1.3.2: сохраняем hash при нормализации
-        if (record_sl.file_p !== '') {
-            filePCounts.set(record_sl.file_p, (filePCounts.get(record_sl.file_p) || 0) + 1);
-        }
+        record_sl.hash_f = audit_fields(original.hash_f);
+        record_sl.need_upd = typeof original.need_upd === 'boolean' ? original.need_upd : computeNeedUpd(record_sl.s_status, record_sl.date_upd);
+        
+        if (record_sl.file_p !== '') filePCounts.set(record_sl.file_p, (filePCounts.get(record_sl.file_p) || 0) + 1);
         entries.push({ oldKey, record: record_sl, original });
     }
-
+    
     for (const { oldKey, record: record_sl, original } of entries) {
         if (record_sl.file_p !== '' && (filePCounts.get(record_sl.file_p) || 0) > 1) {
             record_sl.file_p = '';
             del_file_p++;
         }
         const upd_key = oldKey !== record_sl.url_s;
-        if (upd_key) {
-            keyChanges.push({ oldKey, record: record_sl });
-        } else if (recordsDiffer(record_sl, original)) {
-            fieldChanges.push(record_sl);
-        }
+        if (upd_key) keyChanges.push({ oldKey, record: record_sl });
+        else if (recordsDiffer(record_sl, original)) fieldChanges.push(record_sl);
     }
-
-    // v1.3.4: puts без await — все запросы уходят в одну транзакцию одним
-    // батчем (было: N ожиданий round-trip). Ошибка транзакции всплывает
-    // через tx.done, индивидуальный catch гасит только дубль промиса.
-    for (const record of fieldChanges) {
-        tx.store.put(record).catch(() => {});
-    }
+    
+    for (const record of fieldChanges) tx.store.put(record).catch(() => {});
     for (const change of keyChanges) {
         try {
             const exist_new = await tx.store.get(change.record.url_s);
@@ -718,26 +463,20 @@ async function fix(arr_file_p = []) {
                 merged.url_fh = change.record.url_fh || exist_new.url_fh;
                 merged.file_p = change.record.file_p || exist_new.file_p;
                 merged.id_f = change.record.id_f || exist_new.id_f;
+                merged.need_upd = change.record.need_upd || exist_new.need_upd || false;
                 await tx.store.put(merged);
                 await tx.store.delete(change.oldKey);
             } else {
                 await tx.store.put(change.record);
                 await tx.store.delete(change.oldKey);
             }
-        } catch (e) {
-            console.error('fix: ошибка обновления ключа:', change.oldKey, e);
-        }
+        } catch (e) { console.error('fix: ошибка обновления ключа:', change.oldKey, e); }
     }
     await tx.done;
     fsd_monitor.s_c = await countRecord();
-    console.log('fix: готово. обновлено полей:', fieldChanges.length,
-        'ключей:', keyChanges.length,
-        'дубликатов file_p очищено:', del_file_p);
+    console.log('fix: готово. обновлено полей:', fieldChanges.length, 'ключей:', keyChanges.length, 'дубликатов file_p очищено:', del_file_p);
 }
 
-// ============================================================================
-// create_arr_sl — формирование очереди URL
-// ============================================================================
 async function create_arr_sl(regim) {
     const db = await getDB();
     const array_sl = [];
@@ -749,18 +488,12 @@ async function create_arr_sl(regim) {
         if (regim === 0) {
             array_sl.push(v.url_s);
         } else if (regim === 1) {
-            // v1.3.2: 'invalid' автоматически не переспрашиваем — только
-            // вручную (add_url) или полным аудитом (regim=0)
-            const needsUpdate = !v.url_fh
-                || (!v.file_p && v.s_status !== 'invalid')
-                || NEEDS_UPDATE_STATUSES.has(v.s_status);
-            if (needsUpdate) {
-                array_sl.push(v.url_s);
-            }
+            const needsUpdate = !v.url_fh || (!v.file_p && v.s_status !== 'invalid') || v.need_upd === true;
+            if (needsUpdate) array_sl.push(v.url_s);
         }
         if (array_sl.length % STATUS_BATCH === 0) {
             fsd_monitor.fsd_status = 'load ' + array_sl.length;
-            sendStatus(); // v1.3.1: без персиста — построение больше не пишет storage
+            sendStatus();
         }
     }
     await tx.done;
@@ -768,9 +501,6 @@ async function create_arr_sl(regim) {
     return array_sl;
 }
 
-// ============================================================================
-// startQueue — единая точка запуска обработки (run и auto-check)
-// ============================================================================
 async function startQueue(array_sl) {
     is_cancelled = false;
     fsd_monitor.is_paused = false;
@@ -781,25 +511,20 @@ async function startQueue(array_sl) {
     currentlyProcessingStartedAt = 0;
     is_processing = false;
     pending_process_next = false;
-    await saveQueueArr(array_sl); // очередь пишется ОДИН раз при построении
+    await saveQueueArr(array_sl);
     await persistAllState();
     ensureProcessNextAlarm();
     sendStatus();
     process_next();
 }
 
-// ============================================================================
-// process_next — основной цикл обработки очереди
-// ============================================================================
 async function process_next() {
-    // Пауза: ничего не делаем, состояние сохраняется. ScheduleNext не вызывается.
     if (fsd_monitor.is_paused) {
         console.log('process_next: пауза активна, ожидаем resume');
         is_processing = false;
         await persistAllState();
         return;
     }
-
     if (is_processing) {
         pending_process_next = true;
         await persistRuntimeState();
@@ -823,7 +548,7 @@ async function process_next() {
             fsd_monitor.fsd_status = 'free';
             fsd_monitor.index_sl = -1;
             fsd_monitor.arr_sl = [];
-            await saveQueueArr([]); // v1.3.1: очередь очищается и в storage
+            await saveQueueArr([]);
             sendStatus();
             console.log('обработка завершена');
         }
@@ -842,14 +567,8 @@ async function process_next() {
     }
 }
 
-// ============================================================================
-// scheduleNext — планирует следующий process_next
-// v1.3.1: backup-alarm создаётся один раз на сессию обработки
-// (раньше clear+create делались каждые PROCESS_NEXT_DELAY_MS).
-// ============================================================================
 function scheduleNext() {
-    if (fsd_monitor.flag_dwd) return;        // ждём завершения загрузки
-    if (fsd_monitor.is_paused) return;       // пауза — не планируем
+    if (fsd_monitor.flag_dwd || fsd_monitor.is_paused) return;
     if (nextTimeoutId) clearTimeout(nextTimeoutId);
     nextTimeoutId = setTimeout(() => {
         nextTimeoutId = null;
@@ -864,31 +583,19 @@ function ensureProcessNextAlarm() {
 }
 
 function clearScheduleNext() {
-    if (nextTimeoutId) {
-        clearTimeout(nextTimeoutId);
-        nextTimeoutId = null;
-    }
+    if (nextTimeoutId) { clearTimeout(nextTimeoutId); nextTimeoutId = null; }
     processAlarmActive = false;
     chrome.alarms.clear(ALARM_PROCESS_NEXT).catch(() => {});
 }
 
-// ============================================================================
-// finishDownloadStep — вызывается после завершения или таймаута загрузки
-// ============================================================================
 function finishDownloadStep() {
     if (fsd_monitor.flag_dwd) {
         fsd_monitor.flag_dwd = false;
-        // После загрузки проверяем очередь: возможно, есть ещё ожидающие загрузки.
         pumpDownloadQueue();
         process_next();
     }
 }
 
-// ============================================================================
-// DOWNLOAD QUEUE — ограничиваем число одновременных загрузок
-// v1.3.1: очередь кэшируется в памяти; в storage пишется одним батчем,
-// а не load-all/save-all на каждый элемент.
-// ============================================================================
 async function getDownloadQueue() {
     if (_dlQueueCache) return _dlQueueCache;
     _dlQueueCache = await loadDownloadQueue();
@@ -897,35 +604,27 @@ async function getDownloadQueue() {
 }
 
 async function flushDownloadQueue() {
-    if (_dlQueueCache) {
-        await saveDownloadQueue(_dlQueueCache);
-    }
+    if (_dlQueueCache) await saveDownloadQueue(_dlQueueCache);
 }
 
 async function enqueueDownload(url_s, url_fh) {
     const queue = await getDownloadQueue();
-    // Не добавляем дубликаты (v1.3.4: проверка через Set — O(1))
     if (_dlQueueUrls.has(url_s)) return;
     _dlQueueUrls.add(url_s);
     queue.push({ url_s, url_fh, enqueued_at: Date.now() });
-    // на диск сбросит flushDownloadQueue (один вызов на батч)
 }
 
 async function pumpDownloadQueue() {
-    if (fsd_monitor.is_paused) {
-        await flushDownloadQueue();
-        return;
-    }
+    if (fsd_monitor.is_paused) { await flushDownloadQueue(); return; }
     const queue = await getDownloadQueue();
     let started = 0;
     while (queue.length > 0 && activeDownloadUrls.size < S().MAX_CONCURRENT_DOWNLOADS) {
         const item = queue.shift();
         _dlQueueUrls.delete(item.url_s);
         started++;
-        // Запускаем загрузку (в обход лимита, т.к. мы только что освободили слот)
         await startDownloadInternal(item.url_s, item.url_fh, { persist: false });
     }
-    await flushDownloadQueue(); // одна запись на батч, а не на каждый элемент
+    await flushDownloadQueue();
     if (started > 0) await persistRuntimeState();
 }
 
@@ -935,26 +634,19 @@ async function startDownloadInternal(url_s, url_fh, opts) {
         return;
     }
     activeDownloadUrls.add(url_fh);
-    // v1.3.1: watchdog-таймаут привязан к реальному СТАРТУ загрузки.
-    // Раньше alarm создавался в add_sl — элементы, стоящие в очереди,
-    // могли «истечь» ещё до начала скачивания.
     await startDownloadTimeout(url_s);
-    if (!opts || opts.persist !== false) {
-        await persistRuntimeState();
-    }
-
-    chrome.downloads.download({
-        url: url_fh,
-        saveAs: false,
-        conflictAction: 'overwrite',
-    }, function (downloadId) {
+    if (!opts || opts.persist !== false) await persistRuntimeState();
+    
+    chrome.downloads.download({ url: url_fh, saveAs: false, conflictAction: 'overwrite' }, function (downloadId) {
         if (chrome.runtime.lastError) {
             console.log('ошибка загрузки:', chrome.runtime.lastError.message);
             activeDownloadUrls.delete(url_fh);
             closePendingDownload(url_s);
             persistRuntimeState();
-            // Не finishDownloadStep — иначе сбросит flag_dwd другого URL.
-            // Просто пробуем следующий из очереди.
+            if (activeDownloadUrls.size === 0) {
+                fsd_monitor.flag_dwd = false;
+                scheduleNext();
+            }
             pumpDownloadQueue();
         } else {
             console.log(fsd_monitor.c_u_s + 1, ' загрузка началась, id:', downloadId);
@@ -963,14 +655,6 @@ async function startDownloadInternal(url_s, url_fh, opts) {
     });
 }
 
-// ============================================================================
-// add_sl — добавление/обновление записи
-// v1.3.1: убран chrome.downloads.search перед каждой загрузкой (дубли уже
-// отслеживаются в activeDownloadUrls) и countRecord на каждый вызов
-// (счётчик обновляется вызывающими сторонами один раз на операцию).
-// v1.3.6: noStatusResolve=true — записать статус из API как есть, не
-// подменяя его на 'old' по давней дате (используется для данных processUrl).
-// ============================================================================
 async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
     const record_sl = new t_rec_sl();
     record_sl.url_s = normalize(exp_rec.url_s || '');
@@ -979,107 +663,77 @@ async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
         fsd_monitor.flag_dwd = false;
         return;
     }
-
     const parsed_date = parseDate(exp_rec.date_upd);
-    record_sl.date_upd = parsed_date.toISOString(); // v1.3.1: единый формат дат
-    record_sl.s_status = noStatusResolve
-        ? (exp_rec.s_status || '')
-        : resolveStatus(exp_rec.s_status || '', parsed_date);
+    record_sl.date_upd = parsed_date.toISOString();
+    record_sl.s_status = noStatusResolve ? (exp_rec.s_status || '') : resolveStatus(exp_rec.s_status || '', parsed_date);
     record_sl.url_fh = exp_rec.url_fh || '';
     record_sl.name = buildFileName(record_sl.url_s);
     record_sl.file_p = exp_rec.file_p || '';
     record_sl.id_f = exp_rec.id_f || '';
     record_sl.hash_f = exp_rec.hash_f || '';
+    record_sl.need_upd = computeNeedUpd(record_sl.s_status, record_sl.date_upd); // v1.3.7
 
     const db = await getDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const exist_rec = (await tx.store.get(record_sl.url_s)) || new t_rec_sl();
     const exist_date = parseDate(exist_rec.date_upd);
-
-    // v1.3.2: изменение hash (первый hash — только сохраняем, без перекачки).
-    // v1.3.3: hash = md5 файла — меняется и при регенерации серверного кэша
-    // без изменения контента, поэтому перекачка ограничена (ветка hashChanged)
-    const hashChanged = record_sl.hash_f !== ''
-        && exist_rec.hash_f !== ''
-        && record_sl.hash_f !== exist_rec.hash_f;
+    
+    const hashChanged = record_sl.hash_f !== '' && exist_rec.hash_f !== '' && record_sl.hash_f !== exist_rec.hash_f;
     const hashNew = record_sl.hash_f !== '' && exist_rec.hash_f === '';
-
     const reasons = [];
+    
     if (parsed_date > exist_date) reasons.push('новая дата');
     if (record_sl.url_fh !== '' && record_sl.url_fh !== exist_rec.url_fh) reasons.push('новый url_fh');
     if (hashChanged) reasons.push('изменился hash контента');
     if (hashNew) reasons.push('первый hash');
     if (exist_rec.file_p === '') reasons.push('нет file_p');
-    if (record_sl.s_status !== exist_rec.s_status) {
-        reasons.push('статус: ' + exist_rec.s_status + ' → ' + record_sl.s_status);
-    }
+    if (record_sl.s_status !== exist_rec.s_status) reasons.push('статус: ' + exist_rec.s_status + ' → ' + record_sl.s_status);
+    if (record_sl.need_upd !== !!exist_rec.need_upd) reasons.push('need_upd: ' + !!exist_rec.need_upd + ' → ' + record_sl.need_upd);
+
     const needsUpdate = reasons.length > 0;
-    if (needsUpdate) {
-        console.log('add_sl: обновление для', record_sl.url_s, '— причины:', reasons.join(', '));
-    }
+    if (needsUpdate) console.log('add_sl: обновление для', record_sl.url_s, '— причины:', reasons.join(', '));
+    
     if (!needsUpdate) {
         await tx.done;
         fsd_monitor.flag_dwd = false;
         return;
     }
-
+    
     let needDownload = false;
     if (noDownload && exist_date.getTime() === 0) {
         console.log('upd db');
     } else if (parsed_date > exist_date) {
-        if (!noDownload) {
-            record_sl.file_p = '';
-            record_sl.id_f = '';
-            needDownload = true;
-        }
+        if (!noDownload) { record_sl.file_p = ''; record_sl.id_f = ''; needDownload = true; }
         console.log('new date');
     } else if (record_sl.url_fh !== '' && record_sl.url_fh !== exist_rec.url_fh) {
-        if (!noDownload) {
-            record_sl.file_p = '';
-            record_sl.id_f = '';
-            needDownload = true;
-        }
+        if (!noDownload) { record_sl.file_p = ''; record_sl.id_f = ''; needDownload = true; }
         console.log('new url');
     } else if (hashChanged) {
-        // v1.3.3: hash = md5 файла; при регенерации серверного кэша он меняется
-        // без изменения контента. Перекачиваем только ongoing-истории (реальное
-        // обновление) или записи без файла; для old/complete с валидным файлом
-        // молча запоминаем новый hash, не трогая существующий файл.
         const silentHashUpdate = record_sl.s_status !== 'ongoing' && exist_rec.file_p !== '';
         if (!noDownload && !silentHashUpdate) {
-            record_sl.file_p = '';
-            record_sl.id_f = '';
-            needDownload = true;
+            record_sl.file_p = ''; record_sl.id_f = ''; needDownload = true;
             console.log('new hash — перекачка');
         } else {
-            record_sl.file_p = exist_rec.file_p || '';
-            record_sl.id_f = exist_rec.id_f || '';
-            console.log('new hash — без перекачки',
-                silentHashUpdate ? '(не ongoing, файл есть)' : '');
+            record_sl.file_p = exist_rec.file_p || ''; record_sl.id_f = exist_rec.id_f || '';
+            console.log('new hash — без перекачки', silentHashUpdate ? '(не ongoing, файл есть)' : '');
         }
     } else if (record_sl.s_status !== exist_rec.s_status) {
-        record_sl.file_p = exist_rec.file_p || '';
-        record_sl.id_f = exist_rec.id_f || '';
-        // v1.3.2: статус изменился, а файла нет — скачиваем (реанимация
-        // записей со сброшенным 'invalid' за один проход проверки)
+        record_sl.file_p = exist_rec.file_p || ''; record_sl.id_f = exist_rec.id_f || '';
         needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new status');
     } else {
-        record_sl.file_p = exist_rec.file_p || '';
-        record_sl.id_f = exist_rec.id_f || '';
+        record_sl.file_p = exist_rec.file_p || ''; record_sl.id_f = exist_rec.id_f || '';
         needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new file');
     }
-
+    
     await tx.store.put(record_sl);
     await tx.done;
-
+    
     if (record_sl.url_fh !== '' && needDownload) {
         console.log('add_sl: нужна загрузка, url =', record_sl.url_fh);
         if (activeDownloadUrls.size >= S().MAX_CONCURRENT_DOWNLOADS) {
-            // Превышен лимит — ставим в очередь
-            console.log('add_sl: лимит загрузок (', activeDownloadUrls.size,
-                '), ставим в очередь:', record_sl.url_fh);
+            console.log('add_sl: лимит загрузок, ставим в очередь:', record_sl.url_fh);
             await enqueueDownload(record_sl.url_s, record_sl.url_fh);
         } else {
             await startDownloadInternal(record_sl.url_s, record_sl.url_fh);
@@ -1090,47 +744,28 @@ async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
     }
 }
 
-// ============================================================================
-// ОБРАБОТЧИКИ chrome.downloads.onChanged
-// ============================================================================
 async function handleDownloadComplete(delta, dwd) {
     const downloadItem = dwd[0];
     const rec = await getRecordByDownloadUrl(downloadItem.url);
     downloadResumeAttempts.delete(delta.id);
     activeDownloadUrls.delete(downloadItem.url);
-
-    // v1.3.1: валидация переписана — text/html допустим только для HTML-историй
-    // (html_url у fichub имеет вид /cache/html/<id>; файл приходит как zip)
+    
     let validation = { valid: true };
     if (rec) {
         const expectHtml = !!(rec.url_fh && rec.url_fh.includes('/cache/html/'));
         validation = validateDownloadedFile(downloadItem, S(), { expectHtml });
     }
-
+    
     if (rec) {
         if (!validation.valid) {
-            // Файл невалиден — помечаем запись и удаляем файл
             log('warn', 'bg', 'валидация не пройдена для ' + rec.url_s + ': ' + validation.reason, validation);
             rec.s_status = 'invalid';
+            rec.need_upd = false; // v1.3.7: invalid не должен переспрашиваться
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
-            try {
-                // v1.3.1: убран некорректный второй аргумент false вместо callback
-                await chrome.downloads.removeFile(delta.id);
-            } catch (e) {
-                log('debug', 'bg', 'не удалось удалить невалидный файл', e);
-            }
-            // v1.3.4: вычищаем запись из списка загрузок Chrome. Ошибочные
-            // ответы fichub (кэш регенерируется) приходят как application/json
-            // и Chrome сохраняет их мусорными <id>.json-файлами — теперь они
-            // не захламляют список загрузок пользователя.
-            try {
-                await chrome.downloads.erase({ id: delta.id });
-            } catch (e) {
-                log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e);
-            }
+            try { await chrome.downloads.removeFile(delta.id); } catch (e) { log('debug', 'bg', 'не удалось удалить невалидный файл', e); }
+            try { await chrome.downloads.erase({ id: delta.id }); } catch (e) { log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e); }
             fsd_monitor.c_e_s++;
-            // v1.3.1: честная метрика вместо total_urls_timeout
             await updateMetrics(m => { m.total_invalid_files++; return m; });
         } else {
             const fullPath = downloadItem.filename || '';
@@ -1143,95 +778,56 @@ async function handleDownloadComplete(delta, dwd) {
             log('info', 'bg', 'загрузка завершена: ' + (rec.file_p || rec.url_s));
         }
     }
-    // v1.3.2: completed инкрементируется только для валидных файлов —
-    // раньше каждая отбракованная загрузка тоже считалась «завершённой»
     await persistRuntimeState();
-    // v1.3.1: убрана 5-сек sleep в обработчике (держала SW живым;
-    // pacing обеспечивает scheduleNext)
     finishDownloadStep();
 }
 
 async function handleDownloadInterrupted(delta, dwd) {
     const attempts = (downloadResumeAttempts.get(delta.id) || 0) + 1;
     downloadResumeAttempts.set(delta.id, attempts);
-    await updateMetrics(m => {
-        m.total_downloads_interrupted++;
-        m.total_resume_attempts++;
-        return m;
-    });
+    await updateMetrics(m => { m.total_downloads_interrupted++; m.total_resume_attempts++; return m; });
     await persistRuntimeState();
-
-    // v1.3.4: fail-fast для постоянных ошибок сервера — раньше SERVER_BAD_CONTENT
-    // (fichub отдаёт 4xx вместо файла, пока кэш регенерируется) перемалывался
-    // всеми 20 попытками resume, каждая оставляла в списке загрузок Chrome
-    // оборванную мусорную запись с .json-именем.
+    
     const errorCode = delta.error && delta.error.current;
     const permanentError = errorCode && PERMANENT_DL_ERRORS.has(errorCode);
-    // v1.3.5: FILE_NOT_FOUND — постоянная ошибка «файл не найден», а не таймаут
     const notFoundError = errorCode === 'FILE_NOT_FOUND';
-
+    
     if (permanentError || notFoundError || attempts > MAX_RESUME_ATTEMPTS) {
-        console.error(permanentError || notFoundError
-            ? 'постоянная ошибка загрузки (' + errorCode + '), resume не нужен:'
-            : 'превышен лимит resume для:', delta.id);
+        console.error(permanentError || notFoundError ? 'постоянная ошибка загрузки (' + errorCode + '), resume не нужен:' : 'превышен лимит resume для:', delta.id);
         downloadResumeAttempts.delete(delta.id);
         activeDownloadUrls.delete(dwd[0].url);
         const rec = await getRecordByDownloadUrl(dwd[0].url);
         if (rec) {
             rec.s_status = notFoundError ? 'not_found' : 'timeout';
+            rec.need_upd = true; // v1.3.7: ошибка загрузки — перепроверить
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
         }
-        // v1.3.5: метрики ошибок разделены
-        await updateMetrics(m => {
-            if (notFoundError) m.total_urls_not_found++;
-            else m.total_urls_timeout++;
-            return m;
-        });
-        // v1.3.4: убираем оборванную запись из истории загрузок Chrome
-        try {
-            await chrome.downloads.erase({ id: delta.id });
-        } catch (e) {
-            log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e);
-        }
+        await updateMetrics(m => { if (notFoundError) m.total_urls_not_found++; else m.total_urls_timeout++; return m; });
+        try { await chrome.downloads.erase({ id: delta.id }); } catch (e) { log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e); }
         await persistRuntimeState();
         finishDownloadStep();
         return;
     }
-
+    
     console.log('перезапуск загрузки, попытка', attempts, 'id:', delta.id);
-    // v1.3.1: resume ТОЛЬКО через chrome.alarms — обработка в главном
-    // onAlarm-листенере переживает смерть SW. Раньше обработчик висел на
-    // замыкании текущего экземпляра SW и терялся при рестарте.
     await chrome.alarms.create(ALARM_RESUME_DL_PREFIX + delta.id, { delayInMinutes: 0.5 });
 }
 
-// v1.3.1: выделенная функция повторного запуска загрузки — вызывается из
-// главного onAlarm-обработчика (работает и после рестарта SW).
 async function resumeDownload(downloadId) {
-    try {
-        await chrome.downloads.cancel(downloadId);
-    } catch (e) {
-        // уже завершена/отменена — не критично
-    }
+    try { await chrome.downloads.cancel(downloadId); } catch (e) { /* уже завершена/отменена */ }
     const dwd = await chrome.downloads.search({ id: downloadId });
     if (!Array.isArray(dwd) || dwd.length === 0) return;
-
     const url = dwd[0].url;
     const attempts = downloadResumeAttempts.get(downloadId) || 1;
     const rec = await getRecordByDownloadUrl(url);
     downloadResumeAttempts.delete(downloadId);
     activeDownloadUrls.delete(url);
-
-    if (!rec || !rec.url_fh) {
-        finishDownloadStep();
-        return;
-    }
-    chrome.downloads.download({
-        url: rec.url_fh,
-        saveAs: false,
-        conflictAction: 'overwrite',
-    }, function (newDownloadId) {
+    
+    if (!rec || !rec.url_fh) { finishDownloadStep(); return; }
+    
+    await startDownloadTimeout(rec.url_s); // v1.3.7: свежий watchdog
+    chrome.downloads.download({ url: rec.url_fh, saveAs: false, conflictAction: 'overwrite' }, function (newDownloadId) {
         if (chrome.runtime.lastError) {
             console.log('ошибка повторной загрузки:', chrome.runtime.lastError.message);
             finishDownloadStep();
@@ -1253,21 +849,11 @@ chrome.downloads.onChanged.addListener(async function (delta) {
     try {
         const host = new URL(dwd[0].url).hostname;
         if (host !== FICHUB_HOST) return;
-        if (delta.state.current === 'complete') {
-            await handleDownloadComplete(delta, dwd);
-        } else if (delta.state.current === 'interrupted') {
-            await handleDownloadInterrupted(delta, dwd);
-        }
-    } catch (e) {
-        console.log('не удалось разобрать URL:', e);
-    }
+        if (delta.state.current === 'complete') await handleDownloadComplete(delta, dwd);
+        else if (delta.state.current === 'interrupted') await handleDownloadInterrupted(delta, dwd);
+    } catch (e) { console.log('не удалось разобрать URL:', e); }
 });
 
-// ============================================================================
-// ВОССТАНОВЛЕНИЕ АКТИВНЫХ ЗАГРУЗОК ПОСЛЕ ПЕРЕЗАПУСКА SW
-// v1.3.1: search только in_progress (раньше выгружалась вся история
-// загрузок браузера — потенциально десятки тысяч записей).
-// ============================================================================
 async function reattachPendingDownloads() {
     try {
         const downloads = await chrome.downloads.search({ state: 'in_progress' });
@@ -1285,78 +871,43 @@ async function reattachPendingDownloads() {
                     pendingDownloadTimeouts.add(normalizedUrl);
                 }
                 activeDownloadUrls.add(d.url);
-                const elapsed = d.startTime ? (Date.now() - d.startTime) : 0;
+                // v1.3.7: исправлен NaN при вычислении elapsed
+                const elapsed = d.startTime ? (Date.now() - new Date(d.startTime).getTime()) : 0;
                 const remaining = Math.max(S().DOWNLOAD_TIMEOUT_MS - elapsed, 60000);
-                await chrome.alarms.create(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl, {
-                    delayInMinutes: Math.max(remaining / 60000, 1),
-                });
+                await chrome.alarms.create(ALARM_DOWNLOAD_TIMEOUT_PREFIX + normalizedUrl, { delayInMinutes: Math.max(remaining / 60000, 1) });
                 reattached++;
-            } catch (e) {
-                // skip invalid downloads
-            }
+            } catch (e) { /* skip invalid downloads */ }
         }
         if (reattached > 0) {
             console.log('reattachPendingDownloads: переподключено загрузок:', reattached);
             await persistRuntimeState();
         }
-    } catch (e) {
-        console.warn('reattachPendingDownloads error:', e);
-    }
+    } catch (e) { console.warn('reattachPendingDownloads error:', e); }
 }
 
-// ============================================================================
-// RESUME ЛОГИКА ПРИ ЗАПУСКЕ SW
-// ============================================================================
 async function resumeProcessingIfNeeded() {
-    // Шаг 1: если SW умер во время обработки URL — помечаем как timeout
     if (currentlyProcessingUrl) {
-        console.warn('resumeProcessingIfNeeded: SW прерван при обработке URL, помечаем как timeout:',
-            currentlyProcessingUrl);
+        console.warn('resumeProcessingIfNeeded: SW прерван при обработке URL, помечаем как timeout:', currentlyProcessingUrl);
         try {
-            await add_sl({
-                url_s: currentlyProcessingUrl,
-                url_fh: '',
-                s_status: 'timeout',
-                date_upd: new Date(0).toISOString(),
-                file_p: '',
-                id_f: '',
-            }, true);
+            await markErrorRecord(currentlyProcessingUrl, false);
             await saveFetchState(currentlyProcessingUrl, null);
-        } catch (e) {
-            console.error('resumeProcessingIfNeeded: ошибка пометки timeout:', e);
-        }
+        } catch (e) { console.error('resumeProcessingIfNeeded: ошибка пометки timeout:', e); }
         currentlyProcessingUrl = null;
         currentlyProcessingStartedAt = 0;
         is_processing = false;
         fsd_monitor.flag_dwd = false;
         await updateMetrics(m => { m.total_urls_timeout++; return m; });
     }
-
-    // Шаг 2: реаттачим активные загрузки
     await reattachPendingDownloads();
-
-    // Шаг 3: чистим потерянные api-backoff alarms (v1.3.4: параллельно)
     const alarms = await chrome.alarms.getAll();
-    await Promise.all(alarms
-        .filter(a => a.name.startsWith(ALARM_API_BACKOFF_PREFIX))
-        .map(a => chrome.alarms.clear(a.name)));
-
-    // Шаг 4: продолжаем обработку если не на паузе и не отменено
-    if (is_cancelled) {
-        console.log('resumeProcessingIfNeeded: is_cancelled=true, обработка не возобновляется');
-        return;
-    }
-
-    if (fsd_monitor.is_paused) {
-        console.log('resumeProcessingIfNeeded: is_paused=true, обработка приостановлена');
-        return;
-    }
-
+    await Promise.all(alarms.filter(a => a.name.startsWith(ALARM_API_BACKOFF_PREFIX)).map(a => chrome.alarms.clear(a.name)));
+    
+    if (is_cancelled || fsd_monitor.is_paused) return;
+    
     if (fsd_monitor.fsd_status === 'work' && fsd_monitor.arr_sl && fsd_monitor.arr_sl.length > 0) {
         is_processing = false;
         pending_process_next = false;
-        console.log('resumeProcessingIfNeeded: возобновление обработки, index_sl=',
-            fsd_monitor.index_sl, 'из', fsd_monitor.arr_sl.length - 1);
+        console.log('resumeProcessingIfNeeded: возобновление обработки, index_sl=', fsd_monitor.index_sl, 'из', fsd_monitor.arr_sl.length - 1);
         ensureProcessNextAlarm();
         process_next();
     } else if (fsd_monitor.flag_dwd) {
@@ -1364,110 +915,59 @@ async function resumeProcessingIfNeeded() {
     } else {
         console.log('resumeProcessingIfNeeded: активной обработки нет');
     }
-
-    // Шаг 5: запускаем очередь загрузок (если что-то накопилось)
     await pumpDownloadQueue();
 }
 
-// ============================================================================
-// AUTO-CHECK: периодическая проверка обновлений старых незакрытых историй
-// v1.3.6: выборка = записи с date_upd старше 5 лет (индекс by_date_upd) в
-// статусах old/ongoing — «старые незакрытые истории». Ветка ongoing нужна,
-// пока миграция restoreOldStatuses() ещё не пересчитала статусы. Записи со
-// свежей датой (< 5 лет) не проверяются — только полным аудитом (regim=0).
-// ============================================================================
 async function runAutoCheck() {
     const settings = S();
-    if (!settings.AUTO_CHECK_ENABLED) {
-        log('debug', 'bg', 'auto-check: отключён в настройках');
-        return;
-    }
-    if (fsd_monitor.fsd_status === 'work' || is_processing) {
-        log('info', 'bg', 'auto-check: уже идёт обработка, пропускаем');
-        return;
-    }
-    if (fsd_monitor.is_paused) {
-        log('info', 'bg', 'auto-check: пауза активна, пропускаем');
-        return;
-    }
+    if (!settings.AUTO_CHECK_ENABLED || fsd_monitor.fsd_status === 'work' || is_processing || fsd_monitor.is_paused) return;
     try {
-        // Создаём очередь из старых незакрытых историй (old + давний ongoing)
         const db = await getDB();
         const array_sl = [];
         const tx = db.transaction(STORE_NAME, 'readonly');
         const index = tx.store.index('by_date_upd');
         const cutoff = new Date(Date.now() - FIVE_YEARS_MS).toISOString();
-        for await (const cursor of index.lowerBound(new Date(0))) {
+        // v1.3.7: lowerBound('') вместо new Date(0) для корректной работы со строковыми ключами
+        for await (const cursor of index.lowerBound('')) {
             const v = cursor.value;
             if (!v) continue;
-            if (!v.date_upd || v.date_upd > cutoff) break; // дальше — свежие записи
-            if (v.s_status === 'old' || v.s_status === 'ongoing') {
-                array_sl.push(v.url_s);
-            }
+            if (!v.date_upd || v.date_upd > cutoff) break;
+            if (v.s_status === 'old' || v.s_status === 'ongoing') array_sl.push(v.url_s);
         }
         await tx.done;
         log('info', 'bg', 'auto-check: выбрано старых незакрытых историй: ' + array_sl.length);
         if (array_sl.length === 0) return;
         await startQueue(array_sl);
-    } catch (e) {
-        log('error', 'bg', 'auto-check: ошибка', e);
-    }
+    } catch (e) { log('error', 'bg', 'auto-check: ошибка', e); }
 }
 
-// Настройка auto-check alarm'а в зависимости от settings
 async function setupAutoCheckAlarm() {
     await chrome.alarms.clear(ALARM_AUTO_CHECK);
     const settings = S();
-    if (!settings.AUTO_CHECK_ENABLED) {
-        log('debug', 'bg', 'auto-check: отключён, alarm не создаётся');
-        return;
-    }
+    if (!settings.AUTO_CHECK_ENABLED) return;
     const hours = settings.AUTO_CHECK_INTERVAL_HOURS || 24;
-    if (hours <= 0) {
-        log('debug', 'bg', 'auto-check: interval <= 0, alarm не создаётся');
-        return;
-    }
+    if (hours <= 0) return;
     const periodMinutes = hours * 60;
-    await chrome.alarms.create(ALARM_AUTO_CHECK, {
-        periodInMinutes: Math.max(periodMinutes, 1),
-    });
+    await chrome.alarms.create(ALARM_AUTO_CHECK, { periodInMinutes: Math.max(periodMinutes, 1) });
     log('info', 'bg', 'auto-check: alarm установлен, interval=' + hours + 'ч');
 }
 
-// ============================================================================
-// KEEPALIVE (v1.3.1 — только при активной работе)
-// Раньше alarm будил SW каждые 30 секунд даже в полном простое: каждая
-// побудка гоняла init() с updateMetrics (запись) и downloads.search({})
-// по всей истории. Теперь alarm живёт только пока есть работа.
-// ============================================================================
-function hasActiveWork() {
-    return fsd_monitor.fsd_status === 'work' || activeDownloadUrls.size > 0;
-}
+function hasActiveWork() { return fsd_monitor.fsd_status === 'work' || activeDownloadUrls.size > 0; }
 
 async function manageKeepalive() {
     try {
         if (hasActiveWork()) {
             if (!keepaliveActive) {
                 keepaliveActive = true;
-                await chrome.alarms.create(ALARM_KEEPALIVE, {
-                    periodInMinutes: Math.max(S().KEEPALIVE_PERIOD_MIN, 0.5),
-                });
+                await chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: Math.max(S().KEEPALIVE_PERIOD_MIN, 0.5) });
             }
         } else if (keepaliveActive) {
             keepaliveActive = false;
             await chrome.alarms.clear(ALARM_KEEPALIVE);
         }
-    } catch (e) {
-        console.warn('manageKeepalive error:', e);
-    }
+    } catch (e) { console.warn('manageKeepalive error:', e); }
 }
 
-// ============================================================================
-// МИГРАЦИЯ ДАННЫХ (v1.3.1)
-// Старые записи хранили date_upd как Date — в IDB значения разных типов
-// сортируются отдельно, и порядок индекса by_date_upd был некорректен.
-// Одноразовый проход нормализует все Date в ISO-строки.
-// ============================================================================
 async function normalizeDatesIfNeeded() {
     try {
         const db = await getDB();
@@ -1482,22 +982,10 @@ async function normalizeDatesIfNeeded() {
             }
         }
         await tx.done;
-        if (converted > 0) {
-            console.log('миграция date_upd → ISO: преобразовано записей:', converted);
-        }
-    } catch (e) {
-        console.warn('миграция date_upd error:', e);
-    }
+        if (converted > 0) console.log('миграция date_upd → ISO: преобразовано записей:', converted);
+    } catch (e) { console.warn('миграция date_upd error:', e); }
 }
 
-// ============================================================================
-// МИГРАЦИЯ (v1.3.2): разовая реанимация записей 'invalid'
-// До v1.3.1 валидация браковала html-файлы fichub (файл приходит как
-// application/zip) — записи получали s_status='invalid' и перекачивались
-// бесконечно. Валидация уже исправлена; при обновлении расширения один раз
-// сбрасываем статус, чтобы следующая проверка («Обновить БД», regim=1)
-// скачала корректные файлы и восстановила настоящий статус историй.
-// ============================================================================
 async function resetInvalidStatuses() {
     try {
         const db = await getDB();
@@ -1507,29 +995,16 @@ async function resetInvalidStatuses() {
             const v = cursor.value;
             if (v && v.s_status === 'invalid') {
                 v.s_status = '';
+                v.need_upd = true; // v1.3.7: пометить для перепроверки
                 await cursor.update(v);
                 reset++;
             }
         }
         await tx.done;
-        if (reset > 0) {
-            log('info', 'bg', 'миграция: сброшен статус invalid у записей: ' + reset);
-        }
-    } catch (e) {
-        console.warn('resetInvalidStatuses error:', e);
-    }
+        if (reset > 0) log('info', 'bg', 'миграция: сброшен статус invalid у записей: ' + reset);
+    } catch (e) { console.warn('resetInvalidStatuses error:', e); }
 }
 
-// ============================================================================
-// МИГРАЦИЯ (v1.3.6): восстановление потерянного статуса 'old'
-// В прошлых версиях статус 'old' (ongoing-история без обновлений > 5 лет)
-// терялся: при ошибках (timeout/not_found) или записи извне статус сбрасывался,
-// resolveStatus() применялся только к сохранённому 'ongoing', а fix() мог
-// вообще обнулить статус. Такие старые незакрытые истории выпадали из выборок.
-// При старте SW один раз пересчитываем статус по дате обновления для записей
-// со статусом ''/timeout/not_found — давние (> 5 лет) снова получают 'old'.
-// Идемпотентно: повторный проход ничего не меняет.
-// ============================================================================
 async function restoreOldStatuses() {
     try {
         const db = await getDB();
@@ -1546,42 +1021,41 @@ async function restoreOldStatuses() {
             }
         }
         await tx.done;
-        if (restored > 0) {
-            log('info', 'bg', 'миграция: восстановлен статус old у записей: ' + restored);
-        }
-    } catch (e) {
-        console.warn('restoreOldStatuses error:', e);
-    }
+        if (restored > 0) log('info', 'bg', 'миграция: восстановлен статус old у записей: ' + restored);
+    } catch (e) { console.warn('restoreOldStatuses error:', e); }
 }
 
-// ============================================================================
-// chrome.alarms.onAlarm — ГЛАВНАЯ ТОЧКА ВОЗОБНОВЛЕНИЯ SW ПОСЛЕ TERMINATION
-// ============================================================================
+const NEED_UPD_MIGRATED_KEY = 'fsd_need_upd_migrated';
+async function migrateNeedUpdIfNeeded() {
+    try {
+        const res = await chrome.storage.local.get(NEED_UPD_MIGRATED_KEY);
+        if (res[NEED_UPD_MIGRATED_KEY]) return;
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        let updated = 0;
+        for await (const cursor of tx.store) {
+            const v = cursor.value;
+            if (v && typeof v.need_upd !== 'boolean') {
+                v.need_upd = computeNeedUpd(v.s_status, v.date_upd);
+                await cursor.update(v);
+                updated++;
+            }
+        }
+        await tx.done;
+        await chrome.storage.local.set({ [NEED_UPD_MIGRATED_KEY]: true });
+        console.log('migrateNeedUpd: обновлено записей:', updated);
+    } catch (e) { console.warn('migrateNeedUpd error:', e); }
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name === ALARM_KEEPALIVE) {
-        // v1.3.1: в простое — гасим keepalive и выходим
-        if (!hasActiveWork()) {
-            await manageKeepalive();
-            return;
-        }
-        // Проверяем застрявшую обработку
-        if (currentlyProcessingUrl && currentlyProcessingStartedAt
-            && (Date.now() - currentlyProcessingStartedAt) > STUCK_PROCESSING_THRESHOLD_MS) {
-            console.warn('KEEPALIVE: обнаружена застрявшая обработка, помечаем как timeout:',
-                currentlyProcessingUrl);
+        if (!hasActiveWork()) { await manageKeepalive(); return; }
+        if (currentlyProcessingUrl && currentlyProcessingStartedAt && (Date.now() - currentlyProcessingStartedAt) > STUCK_PROCESSING_THRESHOLD_MS) {
+            console.warn('KEEPALIVE: обнаружена застрявшая обработка, помечаем как timeout:', currentlyProcessingUrl);
             try {
-                await add_sl({
-                    url_s: currentlyProcessingUrl,
-                    url_fh: '',
-                    s_status: 'timeout',
-                    date_upd: new Date(0).toISOString(),
-                    file_p: '',
-                    id_f: '',
-                }, true);
+                await markErrorRecord(currentlyProcessingUrl, false);
                 await saveFetchState(currentlyProcessingUrl, null);
-            } catch (e) {
-                console.error('KEEPALIVE: ошибка пометки timeout:', e);
-            }
+            } catch (e) { console.error('KEEPALIVE: ошибка пометки timeout:', e); }
             currentlyProcessingUrl = null;
             currentlyProcessingStartedAt = 0;
             is_processing = false;
@@ -1590,83 +1064,49 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             await persistRuntimeState();
             if (!fsd_monitor.is_paused) process_next();
         }
-        // Подстраховка: если обработка не идёт, но в очереди есть URL
-        if (!is_processing
-            && !is_cancelled
-            && !fsd_monitor.is_paused
-            && !fsd_monitor.flag_dwd
-            && fsd_monitor.fsd_status === 'work'
-            && fsd_monitor.arr_sl
-            && fsd_monitor.arr_sl.length > 0
-            && fsd_monitor.index_sl < fsd_monitor.arr_sl.length - 1) {
+        if (!is_processing && !is_cancelled && !fsd_monitor.is_paused && !fsd_monitor.flag_dwd && fsd_monitor.fsd_status === 'work' && fsd_monitor.arr_sl && fsd_monitor.arr_sl.length > 0 && fsd_monitor.index_sl < fsd_monitor.arr_sl.length - 1) {
             console.log('KEEPALIVE: обнаружен простой обработки, продолжаем');
             process_next();
         }
-        // Прокачиваем download-очередь
         await pumpDownloadQueue();
         return;
     }
-
     if (alarm.name === ALARM_PROCESS_NEXT) {
         processAlarmActive = false;
         if (!nextTimeoutId && !is_processing && !fsd_monitor.flag_dwd && !fsd_monitor.is_paused) {
             console.log('ALARM PROCESS_NEXT: backup-возобновление обработки');
             process_next();
         }
-        // если работа продолжается — перевзводим backup на случай смерти SW
-        if (fsd_monitor.fsd_status === 'work' && !fsd_monitor.is_paused) {
-            ensureProcessNextAlarm();
-        }
+        if (fsd_monitor.fsd_status === 'work' && !fsd_monitor.is_paused) ensureProcessNextAlarm();
         return;
     }
-
     if (alarm.name === ALARM_AUTO_CHECK) {
         log('info', 'bg', 'auto-check: запуск фоновой проверки ongoing-историй');
         runAutoCheck();
         return;
     }
-
-    // v1.3.1: resume прерванных загрузок обрабатывается здесь (переживает
-    // рестарт SW; раньше обработчик терялся вместе с замыканием)
     if (alarm.name.startsWith(ALARM_RESUME_DL_PREFIX)) {
         const id = Number(alarm.name.slice(ALARM_RESUME_DL_PREFIX.length));
-        if (Number.isFinite(id)) {
-            await resumeDownload(id);
-        }
+        if (Number.isFinite(id)) await resumeDownload(id);
         return;
     }
-
     if (alarm.name.startsWith(ALARM_DOWNLOAD_TIMEOUT_PREFIX)) {
         const url = alarm.name.slice(ALARM_DOWNLOAD_TIMEOUT_PREFIX.length);
         if (pendingDownloadTimeouts.has(url)) {
             console.warn('таймаут загрузки (alarm):', url);
             pendingDownloadTimeouts.delete(url);
-            // v1.3.4: гасим зависшую загрузку и освобождаем слот concurrency.
-            // Раньше зависший in_progress-элемент навсегда оставался в
-            // chrome.downloads (в списке пользователя висели «0 Б/с» записи),
-            // а его url_fh навсегда занимал слот activeDownloadUrls — после
-            // MAX_CONCURRENT_DOWNLOADS таймаутов очередь вставала насмерть.
             try {
                 const rec = await getRecord(url);
                 if (rec && rec.url_fh) {
                     activeDownloadUrls.delete(rec.url_fh);
-                    const stalled = await chrome.downloads.search({
-                        url: rec.url_fh,
-                        state: 'in_progress',
-                    });
+                    const stalled = await chrome.downloads.search({ url: rec.url_fh, state: 'in_progress' });
                     for (const d of stalled) {
                         downloadResumeAttempts.delete(d.id);
-                        try {
-                            await chrome.downloads.cancel(d.id);
-                        } catch (e) { /* уже неактивна */ }
-                        try {
-                            await chrome.downloads.erase({ id: d.id });
-                        } catch (e) { /* не критично */ }
+                        try { await chrome.downloads.cancel(d.id); } catch (e) { /* уже неактивна */ }
+                        try { await chrome.downloads.erase({ id: d.id }); } catch (e) { /* не критично */ }
                     }
                 }
-            } catch (e) {
-                console.warn('таймаут: не удалось расчистить зависшие загрузки:', e);
-            }
+            } catch (e) { console.warn('таймаут: не удалось расчистить зависшие загрузки:', e); }
             await persistRuntimeState();
             finishDownloadStep();
         }
@@ -1674,99 +1114,66 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
 });
 
-// ============================================================================
-// ОБРАБОТЧИК СООБЩЕНИЙ ОТ UI
-// v1.3.1: канал ответа держится открытым только для get_settings.
-// Раньше каждый fire-and-forget запрос держал порт открытым до конца
-// асинхронной обработки.
-// ============================================================================
 chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
     if (!mess || !mess.type_mess) return false;
-
     if (mess.type_mess === 'get_settings') {
         sendResponse({ ok: true, settings: S() });
-        return false; // ответ отправлен синхронно
+        return false;
     }
-
     (async function () {
         try {
             switch (mess.type_mess) {
-            case 'q_status':
-                sendStatus();
-                break;
-            case 'run':
-                await startQueue(await create_arr_sl(mess.regim));
-                break;
-            case 'add_url':
-                await handleAddUrl(mess);
-                break;
-            case 'add_urls':
-                await handleAddUrls(mess);
-                break;
-            case 'pause':
-                fsd_monitor.is_paused = true;
-                clearScheduleNext();
-                await persistAllState();
-                sendStatus();
-                console.log('pause: обработка приостановлена пользователем');
-                break;
-            case 'resume':
-                fsd_monitor.is_paused = false;
-                await persistAllState();
-                sendStatus();
-                console.log('resume: обработка возобновлена пользователем');
-                ensureProcessNextAlarm();
-                if (!is_processing) process_next();
-                await pumpDownloadQueue();
-                break;
-            case 'stop':
-                is_cancelled = true;
-                fsd_monitor = new t_monitor();
-                is_processing = false;
-                pending_process_next = false;
-                currentlyProcessingUrl = null;
-                currentlyProcessingStartedAt = 0;
-                downloadResumeAttempts.clear();
-                pendingDownloadTimeouts.clear();
-                activeDownloadUrls.clear();
-                _dlQueueCache = null;
-                _dlQueueUrls.clear(); // v1.3.4: синхронно с кэшем очереди
-                clearScheduleNext();
-                keepaliveActive = false;
-                {
-                    // v1.3.4: очистка alarms параллельно, а не по одному
-                    const alarms = await chrome.alarms.getAll();
-                    await Promise.all(alarms
-                        .filter(a => a.name.startsWith('fsd_'))
-                        .map(a => chrome.alarms.clear(a.name)));
-                }
-                await clearAllState();
-                sendStatus();
-                break;
-            case 'fix':
-                await fix(mess.arr_file_p);
-                sendStatus();
-                break;
-            case 'read story':
-                chrome.tabs.create({
-                    url: chrome.runtime.getURL('visual.html'),
-                    active: false,
-                });
-                break;
-            case 'save_sl':
-            case 'save_dl':
-            case 'JSON_file':
-            case 'csv_file': {
-                    const msgType = {
-                        save_sl: 'sl_file',
-                        save_dl: 'dl_file',
-                        JSON_file: 'JSON_file',
-                        csv_file: 'csv_file',
-                    }[mess.type_mess];
-                    chrome.tabs.create({
-                        url: chrome.runtime.getURL('save.html'),
-                        active: false,
-                    }, function (tab) {
+                case 'q_status': sendStatus(); break;
+                case 'run': await startQueue(await create_arr_sl(mess.regim)); break;
+                case 'add_url': await handleAddUrl(mess); break;
+                case 'add_urls': await handleAddUrls(mess); break;
+                case 'pause':
+                    fsd_monitor.is_paused = true;
+                    clearScheduleNext();
+                    await persistAllState();
+                    sendStatus();
+                    break;
+                case 'resume':
+                    fsd_monitor.is_paused = false;
+                    await persistAllState();
+                    sendStatus();
+                    ensureProcessNextAlarm();
+                    if (!is_processing) process_next();
+                    await pumpDownloadQueue();
+                    break;
+                case 'stop':
+                    is_cancelled = true;
+                    // v1.3.7: разрешаем все висящие ожидания, чтобы fetchEpubApi мог завершиться
+                    for (const [name, resolve] of pendingAlarmWaits.entries()) {
+                        resolve({ kind: 'cancelled' });
+                        pendingAlarmWaits.delete(name);
+                    }
+                    fsd_monitor = new t_monitor();
+                    is_processing = false;
+                    pending_process_next = false;
+                    currentlyProcessingUrl = null;
+                    currentlyProcessingStartedAt = 0;
+                    downloadResumeAttempts.clear();
+                    pendingDownloadTimeouts.clear();
+                    activeDownloadUrls.clear();
+                    _dlQueueCache = null;
+                    _dlQueueUrls.clear();
+                    clearScheduleNext();
+                    keepaliveActive = false;
+                    {
+                        const alarms = await chrome.alarms.getAll();
+                        await Promise.all(alarms.filter(a => a.name.startsWith('fsd_')).map(a => chrome.alarms.clear(a.name)));
+                    }
+                    await clearAllState();
+                    sendStatus();
+                    break;
+                case 'fix': await fix(mess.arr_file_p); sendStatus(); break;
+                case 'read story':
+                    chrome.tabs.create({ url: chrome.runtime.getURL('visual.html'), active: false });
+                    break;
+                case 'save_sl': case 'save_dl': case 'JSON_file': case 'csv_file': {
+                    const msgType = { save_sl: 'sl_file', save_dl: 'dl_file', JSON_file: 'JSON_file', csv_file: 'csv_file' }[mess.type_mess];
+                    chrome.tabs.create({ url: chrome.runtime.getURL('save.html'), active: false }, function (tab) {
                         chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
                             if (tabId === tab.id && info.status === 'complete') {
                                 chrome.tabs.onUpdated.removeListener(listener);
@@ -1776,35 +1183,30 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
                     });
                     break;
                 }
-            case 'reset_metrics':
-                await saveMetrics({ ...DEFAULT_METRICS });
-                sendStatus();
-                log('info', 'bg', 'метрики сброшены');
-                break;
-            case 'update_settings':
-                if (mess.settings && typeof mess.settings === 'object') {
-                    await saveSettings(mess.settings);
-                    // Кэш обновится автоматически через storage.onChanged listener
-                    await setupAutoCheckAlarm();
-                    // v1.3.1: keepalive пересоздаётся только если он нужен,
-                    // с новым периодом
-                    keepaliveActive = false;
-                    await manageKeepalive();
+                case 'reset_metrics':
+                    await saveMetrics({ ...DEFAULT_METRICS });
                     sendStatus();
-                    log('info', 'bg', 'настройки обновлены');
-                }
-                break;
-            case 'clear_log':
-                await clearLog();
-                log('info', 'bg', 'лог очищен пользователем');
-                break;
-            case 'trigger_auto_check':
-                log('info', 'bg', 'auto-check: ручной запуск');
-                runAutoCheck();
-                break;
-            default:
-                console.log('неизвестное сообщение:', mess.type_mess);
-                break;
+                    log('info', 'bg', 'метрики сброшены');
+                    break;
+                case 'update_settings':
+                    if (mess.settings && typeof mess.settings === 'object') {
+                        await saveSettings(mess.settings);
+                        await setupAutoCheckAlarm();
+                        keepaliveActive = false;
+                        await manageKeepalive();
+                        sendStatus();
+                        log('info', 'bg', 'настройки обновлены');
+                    }
+                    break;
+                case 'clear_log':
+                    await clearLog();
+                    log('info', 'bg', 'лог очищен пользователем');
+                    break;
+                case 'trigger_auto_check':
+                    log('info', 'bg', 'auto-check: ручной запуск');
+                    runAutoCheck();
+                    break;
+                default: console.log('неизвестное сообщение:', mess.type_mess); break;
             }
         } catch (e) {
             console.error('Ошибка в обработчике сообщений:', e);
@@ -1814,24 +1216,14 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
         }
         sendStatus();
     })();
-    return false; // fire-and-forget: порт не держим
+    return false;
 });
 
-// ============================================================================
-// handleAddUrl — добавление одного URL из UI
-// v1.3.1: ветка fs===1 (данные от контент-скрипта) удалена вместе с самим
-// осиротевшим контент-скриптом fsd_content.js.
-// ============================================================================
 async function handleAddUrl(mess) {
     let exp = mess.exp_rec;
     if (!exp || !exp.url_s) {
         if (mess.url_s && mess.url_s !== '') {
-            exp = {
-                url_s: mess.url_s,
-                url_fh: mess.url_f || '',
-                s_status: mess.s_status || '',
-                date_upd: mess.date_upd || new Date(0).toISOString(),
-            };
+            exp = { url_s: mess.url_s, url_fh: mess.url_f || '', s_status: mess.s_status || '', date_upd: mess.date_upd || new Date(0).toISOString() };
         } else {
             console.warn('add_url: нет данных');
             fsd_monitor.flag_dwd = false;
@@ -1840,7 +1232,6 @@ async function handleAddUrl(mess) {
             return;
         }
     }
-
     await add_sl(exp, mess.noDownload || false);
     fsd_monitor.s_c = await countRecord();
     await flushDownloadQueue();
@@ -1848,11 +1239,6 @@ async function handleAddUrl(mess) {
     scheduleNext();
 }
 
-// ============================================================================
-// handleAddUrls — батч-импорт (v1.3.1)
-// Раньше UI слал одно сообщение на каждый URL, и каждый проходил полный цикл
-// (транзакция IDB + персист состояния + статус). Теперь один цикл на батч.
-// ============================================================================
 async function handleAddUrls(mess) {
     const arr = Array.isArray(mess.arr) ? mess.arr : [];
     let processed = 0;
@@ -1868,51 +1254,27 @@ async function handleAddUrls(mess) {
     scheduleNext();
 }
 
-// ============================================================================
-// ХУКИ ЖИЗНЕННОГО ЦИКЛА БРАУЗЕРА
-// ============================================================================
-chrome.runtime.onStartup.addListener(async () => {
-    console.log('onStartup: браузер запущен, инициализация SW');
-    await init();
-});
-
+chrome.runtime.onStartup.addListener(async () => { console.log('onStartup: браузер запущен, инициализация SW'); await init(); });
 chrome.runtime.onInstalled.addListener(async (details) => {
     console.log('onInstalled:', details.reason);
-    // v1.3.2: разовая реанимация записей, побитых старой валидацией
-    if (details.reason === 'update' || details.reason === 'install') {
-        await resetInvalidStatuses();
-    }
+    if (details.reason === 'update' || details.reason === 'install') await resetInvalidStatuses();
     await init();
 });
 
-// ============================================================================
-// ТОЧКА ВХОДА SW
-// ============================================================================
 let initialized = false;
 async function init() {
-    if (initialized) {
-        // onStartup и onInstalled могут сработать после инициализации модуля
-        return;
-    }
+    if (initialized) return;
     initialized = true;
     try {
-        // Сначала загружаем настройки, потом всё остальное (зависит от S())
         await refreshSettingsCache();
         log('info', 'bg', 'SW init start, settings loaded');
         await restoreAllState();
         await setupAutoCheckAlarm();
         await normalizeDatesIfNeeded();
-        // v1.3.6: разово восстанавливаем потерянный статус 'old' (идемпотентно)
         await restoreOldStatuses();
-        // Учитываем старт SW в метриках (кэш + отложенный сброс — без
-        // немедленной записи на диск)
-        await updateMetrics(m => {
-            m.sw_restarts++;
-            m.last_sw_start = Date.now();
-            return m;
-        });
+        await migrateNeedUpdIfNeeded(); // v1.3.7
+        await updateMetrics(m => { m.sw_restarts++; m.last_sw_start = Date.now(); return m; });
         await resumeProcessingIfNeeded();
-        // v1.3.1: keepalive создаётся только если есть активная работа
         await manageKeepalive();
         log('info', 'bg', 'SW инициализирован');
     } catch (e) {
@@ -1920,6 +1282,4 @@ async function init() {
         console.error('SW init error:', e);
     }
 }
-
-// Запускаем init() при первом старте SW (не считая onStartup/onInstalled)
 init();
