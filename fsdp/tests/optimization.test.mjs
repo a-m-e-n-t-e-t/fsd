@@ -10,6 +10,9 @@
 //      метрики total_urls_timeout / total_urls_not_found считаются отдельно
 //  5. Невалидный файл: запись вычищается из истории загрузок Chrome
 //  6. fix(): батч-puts, нормализация ключей/дат, Set-фильтр arr_file_p
+//  7. v1.3.8: массовые upstream-ошибки API («unable to find fic») —
+//     консоль: 1-я + каждая 25-я (не каждая), сводка прогона в логе,
+//     метрики и need_upd считаются для всех
 'use strict';
 import 'fake-indexeddb/auto';
 import { ChromeMock } from './chrome-mock.mjs';
@@ -36,8 +39,17 @@ chromeMock.storage.local._seed('fsd_settings', {
 // smartDelay, т.к. 30000 >= ALARM_MIN_DELAY_MS), второй — успех.
 // Прочие URL не участвуют: add_url с exp_rec не ходит в API.
 let fetchCount = 0;
+let upstreamCalls = 0; // [7]: счётчик upstream-ошибок fichub
+
 globalThis.fetch = async (url) => {
     const s = String(url);
+    if (s.includes('555')) { // [7]: HTTP 200 + upstream-ошибка «unable to find fic»
+        upstreamCalls++;
+        return {
+            ok: true, status: 200, headers: { get: () => null },
+            json: async () => ({ err: -1, msg: 'unable to find fic', ret: 7, upstream: true }),
+        };
+    }
     if (!s.includes('777')) {
         throw new Error('неожиданный fetch в тесте: ' + url);
     }
@@ -372,5 +384,50 @@ await chromeMock.runtime.sendMessage({ type_mess: 'fix', arr_file_p: ['ff_222.zi
         r2 && r2.file_p === 'ff_222.zip');
 }
 
-console.log(`\nОптимизации v1.3.4: ${passed} ok, ${failed} FAIL`);
+console.log('\n[7] массовые ошибки API: троттлинг консоли + сводка прогона');
+{
+    // чистим БД: в прогон должны попасть только 30 upstream-ошибок
+    const db = await getDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    await tx.store.clear();
+    await tx.done;
+    for (let i = 1; i <= 30; ++i) {
+        const n = String(i).padStart(2, '0');
+        await db.put(STORE_NAME, {
+            url_s: `https://www.fanfiction.net/s/555000${n}/`,
+            name: `ff_555000${n}`, date_upd: '2026-01-01T00:00:00.000Z',
+            s_status: 'old', url_fh: '', file_p: '', id_f: '', hash_f: '', need_upd: true,
+        });
+    }
+    await shared.flushMetrics();
+    const mBefore = (chromeMock.storage.local._raw('fsd_metrics') || {}).total_urls_timeout || 0;
+    const origWarn = console.warn;
+    let apiWarns = 0;
+    console.warn = (...a) => { if (a.join(' ').includes('unable to find fic')) apiWarns++; origWarn(...a); };
+    try {
+        await chromeMock.runtime.sendMessage({ type_mess: 'run', regim: 1 });
+        await waitFor('[7] все 30 URL опрошены', () => upstreamCalls >= 30);
+        const hasSummary = await waitFor('[7] сводка прогона в логе (обработано 30)', () =>
+            (chromeMock.storage.local._raw('fsd_log') || [])
+                .some(e => String(e.message || '').includes('проверка завершена: обработано 30')));
+        check('[7] прогон завершился: очередь пуста',
+            JSON.stringify(chromeMock.storage.local._raw('fsd_queue_arr')) === '[]');
+        const sumEntry = (chromeMock.storage.local._raw('fsd_log') || [])
+            .find(e => String(e.message || '').includes('проверка завершена: обработано 30'));
+        check('[7] сводка: обработано 30, таймаут 30',
+            !!(hasSummary && sumEntry && sumEntry.message.includes('обработано 30') && sumEntry.message.includes('таймаут 30')));
+        check('[7] консоль: не более 2 предупреждений на 30 ошибок (1-я + 25-я)',
+            apiWarns >= 1 && apiWarns <= 2);
+        const r1 = await getRec('https://www.fanfiction.net/s/55500001/');
+        check('[7] запись помечена на повторную проверку (need_upd=true)',
+            !!(r1 && r1.need_upd === true));
+        await shared.flushMetrics();
+        const mAfter = (chromeMock.storage.local._raw('fsd_metrics') || {}).total_urls_timeout || 0;
+        check('[7] метрика total_urls_timeout: +30 за прогон', mAfter - mBefore === 30);
+    } finally {
+        console.warn = origWarn;
+    }
+}
+
+console.log(`\nОптимизации v1.3.4–v1.3.8: ${passed} ok, ${failed} FAIL`);
 setTimeout(() => process.exit(failed > 0 ? 1 : 0), 500);

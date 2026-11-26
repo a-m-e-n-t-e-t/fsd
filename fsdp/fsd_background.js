@@ -35,6 +35,32 @@ const ALARM_RESUME_DL_PREFIX = 'fsd_resume_dl_';
 const ALARM_AUTO_CHECK = 'fsd_auto_check';
 const ALARM_MIN_DELAY_MS = 30000; // v1.3.7: поднят до 30с для соответствия минимуму Chrome
 
+// v1.3.8: тихий режим для массовых однотипных событий API. При проверке
+// сотен URL fichub регулярно отвечает «unable to find fic» (upstream-сбой
+// скрейпинга сайта-источника) — раньше каждая такая ошибка падала в консоль
+// с трейсом: сотни строк за прогон и так на каждой автопроверке. Теперь:
+// в консоль — первая ошибка серии и каждая 25-я (с URL), успехи — каждый
+// 25-й, полная картина — в сводке прогона (log) и метриках.
+const API_EVENT_LOG_EVERY = 25;
+const RETRY_LOG_EVERY = 10;
+let _apiErrStreak = 0;
+let _apiOkCount = 0;
+let _kaIdleCount = 0;
+let _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0 };
+function resetRunStats() {
+    _apiErrStreak = 0;
+    _apiOkCount = 0;
+    _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0 };
+}
+function logRunSummary() {
+    const s = _runStats;
+    if (!s || s.processed === 0) return;
+    const errTotal = s.apiTimeout + s.apiNotFound + s.netErr;
+    let msg = `проверка завершена: обработано ${s.processed}, ссылок получено ${s.ok}`;
+    if (errTotal > 0) msg += `, ошибок ${errTotal} (таймаут ${s.apiTimeout}, не найдено ${s.apiNotFound}, прочее ${s.netErr})`;
+    log('info', 'bg', msg);
+}
+
 let fsd_monitor = new t_monitor();
 let is_processing = false;
 let is_cancelled = false;
@@ -235,7 +261,7 @@ async function fetchEpubApi(url_s) {
         try {
             resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s), { signal: AbortSignal.timeout(API_FETCH_TIMEOUT_MS) });
         } catch (e) {
-            console.warn('fetchEpubApi: сетевая ошибка, попытка', state.attempt + 1, e);
+            if (state.attempt % RETRY_LOG_EVERY === 0) console.warn('fetchEpubApi: сетевая ошибка, попытка', state.attempt + 1, e);
             state.attempt++;
             await saveFetchState(url_s, state);
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
@@ -260,7 +286,7 @@ async function fetchEpubApi(url_s) {
             return { ok: false, status: 'not_found' };
         }
         if (!resp.ok) {
-            console.warn('fetchEpubApi: HTTP', resp.status, 'попытка', state.attempt + 1);
+            if (state.attempt % RETRY_LOG_EVERY === 0) console.warn('fetchEpubApi: HTTP', resp.status, 'попытка', state.attempt + 1);
             state.attempt++;
             await saveFetchState(url_s, state);
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
@@ -268,14 +294,14 @@ async function fetchEpubApi(url_s) {
         }
         let res;
         try { res = await resp.json(); } catch (e) {
-            console.warn('fetchEpubApi: ответ не JSON, попытка', state.attempt + 1);
+            if (state.attempt % RETRY_LOG_EVERY === 0) console.warn('fetchEpubApi: ответ не JSON, попытка', state.attempt + 1);
             state.attempt++;
             await saveFetchState(url_s, state);
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
             continue;
         }
         if (!res) {
-            console.warn('fetchEpubApi: пустой ответ');
+            if (state.attempt % RETRY_LOG_EVERY === 0) console.warn('fetchEpubApi: пустой ответ');
             state.attempt++;
             await saveFetchState(url_s, state);
             await shortDelay(API_NETWORK_ERROR_DELAY_MS);
@@ -295,7 +321,11 @@ async function fetchEpubApi(url_s) {
         if (hasError) {
             const upstreamFail = res.upstream === true;
             const status = upstreamFail ? 'timeout' : 'not_found';
-            console.warn('fetchEpubApi: ошибка', res.msg || res.error, '| upstream:', upstreamFail, '| ret:', res.ret, '→', status);
+            _apiErrStreak++;
+            if (_apiErrStreak === 1 || _apiErrStreak % API_EVENT_LOG_EVERY === 0) {
+                console.warn('fetchEpubApi: ошибка', res.msg || res.error, '| upstream:', upstreamFail, '| ret:', res.ret,
+                    '→', status, '| url:', url_s, _apiErrStreak > 1 ? '| подряд: ' + _apiErrStreak : '');
+            }
             await saveFetchState(url_s, null);
             return { ok: false, status, res };
         }
@@ -323,11 +353,15 @@ async function fetchEpubApi(url_s) {
                 if (m2 && m2[1]) s_status = m2[1].replace(/<[^>]+>/g, '').trim();
             }
             const hash_f = (res.hashes && (res.hashes.epub || res.hashes.html)) || '';
-            console.log('fetchEpubApi: успех, url_fh =', urls.html || urls.epub);
+            _apiErrStreak = 0;
+            _apiOkCount++;
+            if (_apiOkCount === 1 || _apiOkCount % API_EVENT_LOG_EVERY === 0) {
+                console.log('fetchEpubApi: успех', _apiOkCount > 1 ? '(' + _apiOkCount + ')' : '', 'url_fh =', urls.html || urls.epub);
+            }
             await saveFetchState(url_s, null);
             return { ok: true, url_fh: urls.html || urls.epub || '', urls, s_status, date_upd: r_date.toISOString(), hash_f };
         }
-        console.log('fetchEpubApi: нет ссылок, попытка', state.attempt + 1);
+        if (state.attempt % RETRY_LOG_EVERY === 0) console.log('fetchEpubApi: нет ссылок, попытка', state.attempt + 1);
         state.attempt++;
         await saveFetchState(url_s, state);
         await shortDelay(S().API_REQUEST_DELAY_MS);
@@ -362,10 +396,14 @@ async function processUrl(url_s) {
         if (is_cancelled) return;
         if (!result.ok) {
             fsd_monitor.c_e_s++;
+            _runStats.processed++;
+            if (result.status === 'timeout') { _runStats.apiTimeout++; await updateMetrics(m => { m.total_urls_timeout++; return m; }); }
+            else if (result.status === 'not_found') { _runStats.apiNotFound++; await updateMetrics(m => { m.total_urls_not_found++; return m; }); }
+            else _runStats.netErr++;
             await markErrorRecord(url_s, result.status === 'not_found');
-            if (result.status === 'timeout') await updateMetrics(m => { m.total_urls_timeout++; return m; });
-            else if (result.status === 'not_found') await updateMetrics(m => { m.total_urls_not_found++; return m; });
         } else {
+            _runStats.processed++;
+            _runStats.ok++;
             await add_sl({
                 url_s: url_s, url_fh: result.url_fh, s_status: result.s_status,
                 date_upd: result.date_upd, file_p: '', id_f: '', hash_f: result.hash_f || '',
@@ -384,6 +422,8 @@ async function processUrl(url_s) {
         if (is_cancelled) return;
         console.error('processUrl error:', e);
         fsd_monitor.c_e_s++;
+        _runStats.processed++;
+        _runStats.netErr++;
         await markErrorRecord(url_s, false);
         await updateMetrics(m => { m.total_urls_timeout++; return m; });
     }
@@ -502,6 +542,7 @@ async function create_arr_sl(regim) {
 }
 
 async function startQueue(array_sl) {
+    resetRunStats(); // v1.3.8: статистика прогона — с чистого листа
     is_cancelled = false;
     fsd_monitor.is_paused = false;
     fsd_monitor.arr_sl = array_sl;
@@ -550,6 +591,7 @@ async function process_next() {
             fsd_monitor.arr_sl = [];
             await saveQueueArr([]);
             sendStatus();
+            if (!is_cancelled) logRunSummary(); // v1.3.8: сводка вместо сотен строк ошибок
             console.log('обработка завершена');
         }
     } catch (e) {
@@ -1065,7 +1107,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             if (!fsd_monitor.is_paused) process_next();
         }
         if (!is_processing && !is_cancelled && !fsd_monitor.is_paused && !fsd_monitor.flag_dwd && fsd_monitor.fsd_status === 'work' && fsd_monitor.arr_sl && fsd_monitor.arr_sl.length > 0 && fsd_monitor.index_sl < fsd_monitor.arr_sl.length - 1) {
-            console.log('KEEPALIVE: обнаружен простой обработки, продолжаем');
+            _kaIdleCount++; // v1.3.8: лог — первое срабатывание и каждое 10-е
+            if (_kaIdleCount === 1 || _kaIdleCount % 10 === 0) console.log('KEEPALIVE: обнаружен простой обработки, продолжаем (срабатываний:', _kaIdleCount + ')');
             process_next();
         }
         await pumpDownloadQueue();
