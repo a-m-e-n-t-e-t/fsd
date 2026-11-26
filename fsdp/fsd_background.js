@@ -3,6 +3,7 @@ import {
     FICHUB_HOST,
     STORE_NAME,
     MAX_RESUME_ATTEMPTS,
+    FIVE_YEARS_MS,
     t_rec_sl,
     t_monitor,
     parseDate,
@@ -49,7 +50,10 @@ const STATUS_BATCH = 100;
 // v1.3.2: 'invalid' убран — записи с невалидным файлом больше не попадают
 // в очередь при каждой проверке (вечная перекачка). Реанимация старых
 // 'invalid'-записей — разовая миграция resetInvalidStatuses() при обновлении.
-const NEEDS_UPDATE_STATUSES = new Set(['ongoing', 'timeout', 'not_found', '']);
+// v1.3.6: восстановлен статус 'old' — старые незакрытые истории (ongoing,
+// дата обновления старше 5 лет) снова участвуют в выборках «проверить все»
+// и авто-проверки.
+const NEEDS_UPDATE_STATUSES = new Set(['ongoing', 'old', 'timeout', 'not_found', '']);
 const PATH_SEPARATOR_REGEX = /[/\\]/;
 const CLEAN_NUMBER_SUFFIX_REGEX = /\s*\(\d+\)/g;
 
@@ -578,6 +582,10 @@ async function processUrl(url_s) {
                 await updateMetrics(m => { m.total_urls_not_found++; return m; });
             }
         } else {
+            // v1.3.6: статус из API записываем как есть (noStatusResolve) —
+            // resolveStatus вернул бы 'old' для давней 'completed', подменив
+            // настоящий серверный статус. 'old' локальным записям назначает
+            // миграция restoreOldStatuses() / fix().
             await add_sl({
                 url_s: url_s,
                 url_fh: result.url_fh,
@@ -586,7 +594,7 @@ async function processUrl(url_s) {
                 file_p: '',
                 id_f: '',
                 hash_f: result.hash_f || '',
-            }, false);
+            }, false, true); // noDownload=false, noStatusResolve=true (v1.3.6)
         }
 
         await updateMetrics(m => {
@@ -960,8 +968,10 @@ async function startDownloadInternal(url_s, url_fh, opts) {
 // v1.3.1: убран chrome.downloads.search перед каждой загрузкой (дубли уже
 // отслеживаются в activeDownloadUrls) и countRecord на каждый вызов
 // (счётчик обновляется вызывающими сторонами один раз на операцию).
+// v1.3.6: noStatusResolve=true — записать статус из API как есть, не
+// подменяя его на 'old' по давней дате (используется для данных processUrl).
 // ============================================================================
-async function add_sl(exp_rec, noDownload = false) {
+async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
     const record_sl = new t_rec_sl();
     record_sl.url_s = normalize(exp_rec.url_s || '');
     if (record_sl.url_s === '') {
@@ -972,7 +982,9 @@ async function add_sl(exp_rec, noDownload = false) {
 
     const parsed_date = parseDate(exp_rec.date_upd);
     record_sl.date_upd = parsed_date.toISOString(); // v1.3.1: единый формат дат
-    record_sl.s_status = resolveStatus(exp_rec.s_status || '', parsed_date);
+    record_sl.s_status = noStatusResolve
+        ? (exp_rec.s_status || '')
+        : resolveStatus(exp_rec.s_status || '', parsed_date);
     record_sl.url_fh = exp_rec.url_fh || '';
     record_sl.name = buildFileName(record_sl.url_s);
     record_sl.file_p = exp_rec.file_p || '';
@@ -1358,7 +1370,11 @@ async function resumeProcessingIfNeeded() {
 }
 
 // ============================================================================
-// AUTO-CHECK: периодическая проверка обновлений ongoing-историй
+// AUTO-CHECK: периодическая проверка обновлений старых незакрытых историй
+// v1.3.6: выборка = записи с date_upd старше 5 лет (индекс by_date_upd) в
+// статусах old/ongoing — «старые незакрытые истории». Ветка ongoing нужна,
+// пока миграция restoreOldStatuses() ещё не пересчитала статусы. Записи со
+// свежей датой (< 5 лет) не проверяются — только полным аудитом (regim=0).
 // ============================================================================
 async function runAutoCheck() {
     const settings = S();
@@ -1375,20 +1391,22 @@ async function runAutoCheck() {
         return;
     }
     try {
-        // Создаём очередь только из ongoing-историй
+        // Создаём очередь из старых незакрытых историй (old + давний ongoing)
         const db = await getDB();
         const array_sl = [];
         const tx = db.transaction(STORE_NAME, 'readonly');
         const index = tx.store.index('by_date_upd');
-        for await (const cursor of index) {
+        const cutoff = new Date(Date.now() - FIVE_YEARS_MS).toISOString();
+        for await (const cursor of index.lowerBound(new Date(0))) {
             const v = cursor.value;
             if (!v) continue;
-            if (v.s_status === 'ongoing') {
+            if (!v.date_upd || v.date_upd > cutoff) break; // дальше — свежие записи
+            if (v.s_status === 'old' || v.s_status === 'ongoing') {
                 array_sl.push(v.url_s);
             }
         }
         await tx.done;
-        log('info', 'bg', 'auto-check: выбрано ongoing-историй: ' + array_sl.length);
+        log('info', 'bg', 'auto-check: выбрано старых незакрытых историй: ' + array_sl.length);
         if (array_sl.length === 0) return;
         await startQueue(array_sl);
     } catch (e) {
@@ -1499,6 +1517,40 @@ async function resetInvalidStatuses() {
         }
     } catch (e) {
         console.warn('resetInvalidStatuses error:', e);
+    }
+}
+
+// ============================================================================
+// МИГРАЦИЯ (v1.3.6): восстановление потерянного статуса 'old'
+// В прошлых версиях статус 'old' (ongoing-история без обновлений > 5 лет)
+// терялся: при ошибках (timeout/not_found) или записи извне статус сбрасывался,
+// resolveStatus() применялся только к сохранённому 'ongoing', а fix() мог
+// вообще обнулить статус. Такие старые незакрытые истории выпадали из выборок.
+// При старте SW один раз пересчитываем статус по дате обновления для записей
+// со статусом ''/timeout/not_found — давние (> 5 лет) снова получают 'old'.
+// Идемпотентно: повторный проход ничего не меняет.
+// ============================================================================
+async function restoreOldStatuses() {
+    try {
+        const db = await getDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        let restored = 0;
+        for await (const cursor of tx.store) {
+            const v = cursor.value;
+            if (!v) continue;
+            const resolved = resolveStatus(v.s_status || '', v.date_upd);
+            if (resolved !== v.s_status) {
+                v.s_status = resolved;
+                await cursor.update(v);
+                restored++;
+            }
+        }
+        await tx.done;
+        if (restored > 0) {
+            log('info', 'bg', 'миграция: восстановлен статус old у записей: ' + restored);
+        }
+    } catch (e) {
+        console.warn('restoreOldStatuses error:', e);
     }
 }
 
@@ -1850,6 +1902,8 @@ async function init() {
         await restoreAllState();
         await setupAutoCheckAlarm();
         await normalizeDatesIfNeeded();
+        // v1.3.6: разово восстанавливаем потерянный статус 'old' (идемпотентно)
+        await restoreOldStatuses();
         // Учитываем старт SW в метриках (кэш + отложенный сброс — без
         // немедленной записи на диск)
         await updateMetrics(m => {
