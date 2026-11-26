@@ -46,17 +46,23 @@ const RETRY_LOG_EVERY = 10;
 let _apiErrStreak = 0;
 let _apiOkCount = 0;
 let _kaIdleCount = 0;
-let _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0 };
+let _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0, dbUpdated: 0, dlStarted: 0, dlQueued: 0 };
 function resetRunStats() {
     _apiErrStreak = 0;
     _apiOkCount = 0;
-    _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0 };
+    _kaIdleCount = 0; // v1.3.9: сброс и счётчика простоев keepalive
+    _runStats = { processed: 0, ok: 0, apiTimeout: 0, apiNotFound: 0, netErr: 0, dbUpdated: 0, dlStarted: 0, dlQueued: 0 };
 }
 function logRunSummary() {
     const s = _runStats;
     if (!s || s.processed === 0) return;
     const errTotal = s.apiTimeout + s.apiNotFound + s.netErr;
     let msg = `проверка завершена: обработано ${s.processed}, ссылок получено ${s.ok}`;
+    if (s.dbUpdated > 0) msg += `, обновлено в БД ${s.dbUpdated}`;
+    if (s.dlStarted > 0 || s.dlQueued > 0) {
+        msg += `, загрузок ${s.dlStarted}`;
+        if (s.dlQueued > 0) msg += ` (+${s.dlQueued} в очереди)`;
+    }
     if (errTotal > 0) msg += `, ошибок ${errTotal} (таймаут ${s.apiTimeout}, не найдено ${s.apiNotFound}, прочее ${s.netErr})`;
     log('info', 'bg', msg);
 }
@@ -68,6 +74,12 @@ let pending_process_next = false;
 let nextTimeoutId = null;
 let currentlyProcessingUrl = null;
 let currentlyProcessingStartedAt = 0;
+// v1.3.9: поколение цикла обработки. Инкрементируется при каждом новом
+// запуске process_next; «зомби»-ветка (убитая keepalive-детектором
+// зависания, но дожившая свои await'ы) со старым поколением больше не
+// сбрасывает флаги is_processing / currentlyProcessingUrl нового цикла
+// и не плодит дубли processing-циклов.
+let _processGen = 0;
 let processAlarmActive = false;
 let keepaliveActive = false;
 const downloadResumeAttempts = new Map();
@@ -257,6 +269,11 @@ async function fetchEpubApi(url_s) {
     }
     while (state.attempt < API_MAX_RETRIES) {
         if (is_cancelled) { await saveFetchState(url_s, null); return { ok: false, status: 'cancelled' }; }
+        // v1.3.9: heartbeat — детектор зависания (KEEPALIVE) меряет время с
+        // последней попытки, а не с начала обработки URL. Легитимные длинные
+        // серии ретраев (до 60 попыток, 429-бэкофф до 120с) больше не убиваются
+        // как «застрявшие» и не порождают параллельных циклов обработки.
+        if (currentlyProcessingUrl === url_s) currentlyProcessingStartedAt = Date.now();
         let resp;
         try {
             resp = await fetch(FICHUB_API_BASE + encodeURIComponent(url_s), { signal: AbortSignal.timeout(API_FETCH_TIMEOUT_MS) });
@@ -379,8 +396,11 @@ async function markErrorRecord(url_s, isNotFound) {
         rec = new t_rec_sl();
         rec.url_s = normalize(url_s);
     }
+    // v1.3.9: not_found затирает статус только у записей без скачанного
+    // файла. Транзитный 404 fichub больше не превращает «completed» в
+    // «not_found» у скачанной истории; перепроверку гарантирует need_upd.
     rec.need_upd = true;
-    if (isNotFound) rec.s_status = 'not_found';
+    if (isNotFound && rec.file_p === '') rec.s_status = 'not_found';
     await tx.store.put(rec);
     await tx.done;
 }
@@ -407,7 +427,7 @@ async function processUrl(url_s) {
             await add_sl({
                 url_s: url_s, url_fh: result.url_fh, s_status: result.s_status,
                 date_upd: result.date_upd, file_p: '', id_f: '', hash_f: result.hash_f || '',
-            }, false, true);
+            }, false);
         }
         await updateMetrics(m => {
             m.total_urls_processed++;
@@ -427,8 +447,12 @@ async function processUrl(url_s) {
         await markErrorRecord(url_s, false);
         await updateMetrics(m => { m.total_urls_timeout++; return m; });
     }
-    currentlyProcessingUrl = null;
-    currentlyProcessingStartedAt = 0;
+    // v1.3.9: зомби-ветка не затирает URL, который к этому моменту начал
+    // обрабатывать новый цикл (после kill детектором зависания)
+    if (currentlyProcessingUrl === url_s) {
+        currentlyProcessingUrl = null;
+        currentlyProcessingStartedAt = 0;
+    }
     await persistRuntimeState();
     if (fsd_monitor.flag_dwd) return;
     await shortDelay(S().API_REQUEST_DELAY_MS);
@@ -442,7 +466,11 @@ async function fix(arr_file_p = []) {
     let del_file_p = 0;
     const filePCounts = new Map();
     const entries = [];
-    const arrFilePSet = arr_file_p.length > 0 ? new Set(arr_file_p) : null;
+    // v1.3.9: список пользователя нормализуется тем же правилом « (N)» —
+    // файл «ff_1 (1).zip» на диске матчится с «ff_1.zip» в БД
+    const arrFilePSet = arr_file_p.length > 0
+        ? new Set(arr_file_p.map(n => String(n || '').replace(CLEAN_NUMBER_SUFFIX_REGEX, '')))
+        : null;
     
     for await (const cursor of tx.store) {
         if (!cursor.value) continue;
@@ -462,14 +490,18 @@ async function fix(arr_file_p = []) {
             const baseName = record_sl.file_p.split(PATH_SEPARATOR_REGEX).pop();
             if (baseName !== record_sl.file_p) record_sl.file_p = baseName;
         }
+        // v1.3.9: чистка суффикса ДО сравнения со списком пользователя.
+        // Раньше сравнение шло по «ff_1 (1).zip», а чистка выполнялась после:
+        // файл незаслуженно обнулялся, история перекачивалась и Chrome
+        // (overwrite при занятом имени) плодил дубли « (2)», « (3)»...
+        const cleanedName = record_sl.file_p.replace(CLEAN_NUMBER_SUFFIX_REGEX, '');
+        if (cleanedName !== record_sl.file_p) record_sl.file_p = cleanedName;
         if (arrFilePSet) {
             if (record_sl.file_p !== '' && !arrFilePSet.has(record_sl.file_p)) {
                 record_sl.file_p = '';
                 del_file_p++;
             }
         }
-        const cleanedName = record_sl.file_p.replace(CLEAN_NUMBER_SUFFIX_REGEX, '');
-        if (cleanedName !== record_sl.file_p) record_sl.file_p = cleanedName;
         record_sl.id_f = original.id_f || '';
         record_sl.hash_f = audit_fields(original.hash_f);
         record_sl.need_upd = typeof original.need_upd === 'boolean' ? original.need_upd : computeNeedUpd(record_sl.s_status, record_sl.date_upd);
@@ -542,6 +574,12 @@ async function create_arr_sl(regim) {
 }
 
 async function startQueue(array_sl) {
+    // v1.3.9: повторный запуск во время активного прогона отклоняется —
+    // раньше он перезаписывал очередь и сбрасывал index_sl, теряя хвост
+    if (fsd_monitor.fsd_status === 'work' && !fsd_monitor.is_paused) {
+        log('warn', 'bg', 'startQueue отклонён: прогон уже идёт');
+        return;
+    }
     resetRunStats(); // v1.3.8: статистика прогона — с чистого листа
     is_cancelled = false;
     fsd_monitor.is_paused = false;
@@ -573,6 +611,7 @@ async function process_next() {
     }
     is_processing = true;
     pending_process_next = false;
+    const gen = ++_processGen; // v1.3.9: фиксируем поколение цикла
     clearScheduleNext();
     try {
         if (!fsd_monitor.arr_sl || fsd_monitor.arr_sl.length === 0) {
@@ -597,6 +636,9 @@ async function process_next() {
     } catch (e) {
         console.error('process_next error:', e);
     } finally {
+        // v1.3.9: устаревшее поколение (зомби-ветка, убитая детектором
+        // зависания или stop) не трогает флаги нового цикла обработки
+        if (gen !== _processGen) return;
         is_processing = false;
         currentlyProcessingUrl = null;
         currentlyProcessingStartedAt = 0;
@@ -645,7 +687,10 @@ async function getDownloadQueue() {
     return _dlQueueCache;
 }
 
+const DL_QUEUE_FLUSH_DELAY_MS = 1000;
+let _dlQueueFlushTimer = null;
 async function flushDownloadQueue() {
+    if (_dlQueueFlushTimer) { clearTimeout(_dlQueueFlushTimer); _dlQueueFlushTimer = null; }
     if (_dlQueueCache) await saveDownloadQueue(_dlQueueCache);
 }
 
@@ -654,6 +699,11 @@ async function enqueueDownload(url_s, url_fh) {
     if (_dlQueueUrls.has(url_s)) return;
     _dlQueueUrls.add(url_s);
     queue.push({ url_s, url_fh, enqueued_at: Date.now() });
+    // v1.3.9: отложенный сброс очереди на диск — раньше запись жила только
+    // в памяти до случайного flush и терялась при смерти service worker
+    if (!_dlQueueFlushTimer) {
+        _dlQueueFlushTimer = setTimeout(() => { _dlQueueFlushTimer = null; flushDownloadQueue(); }, DL_QUEUE_FLUSH_DELAY_MS);
+    }
 }
 
 async function pumpDownloadQueue() {
@@ -697,17 +747,20 @@ async function startDownloadInternal(url_s, url_fh, opts) {
     });
 }
 
-async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
+async function add_sl(exp_rec, noDownload = false) {
     const record_sl = new t_rec_sl();
     record_sl.url_s = normalize(exp_rec.url_s || '');
     if (record_sl.url_s === '') {
         console.warn('add_sl: пустой URL, пропуск');
-        fsd_monitor.flag_dwd = false;
+        fsd_monitor.flag_dwd = activeDownloadUrls.size > 0; // v1.3.9
         return;
     }
     const parsed_date = parseDate(exp_rec.date_upd);
     record_sl.date_upd = parsed_date.toISOString();
-    record_sl.s_status = noStatusResolve ? (exp_rec.s_status || '') : resolveStatus(exp_rec.s_status || '', parsed_date);
+    // v1.3.9: статус всегда нормализуется resolveStatus — раньше «сырой»
+    // ongoing из processUrl переписывался обратно миграцией restoreOldStatuses
+    // при каждом старте SW (пинг-понг статусов в БД)
+    record_sl.s_status = resolveStatus(exp_rec.s_status || '', parsed_date);
     record_sl.url_fh = exp_rec.url_fh || '';
     record_sl.name = buildFileName(record_sl.url_s);
     record_sl.file_p = exp_rec.file_p || '';
@@ -733,11 +786,17 @@ async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
     if (record_sl.need_upd !== !!exist_rec.need_upd) reasons.push('need_upd: ' + !!exist_rec.need_upd + ' → ' + record_sl.need_upd);
 
     const needsUpdate = reasons.length > 0;
-    if (needsUpdate) console.log('add_sl: обновление для', record_sl.url_s, '— причины:', reasons.join(', '));
+    if (needsUpdate) {
+        _runStats.dbUpdated++; // v1.3.9: в сводку прогона вместо консольного шума
+        log('debug', 'bg', 'add_sl: обновление ' + record_sl.url_s + ' — ' + reasons.join(', '));
+    }
     
     if (!needsUpdate) {
         await tx.done;
-        fsd_monitor.flag_dwd = false;
+        // v1.3.9: не сбрасывать флаг загрузки, запущенной другим путём
+        // (раньше add_url во время активной загрузки обнулял flag_dwd и
+        // останавливал конвейер до keepalive)
+        fsd_monitor.flag_dwd = activeDownloadUrls.size > 0;
         return;
     }
     
@@ -760,11 +819,12 @@ async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
             console.log('new hash — без перекачки', silentHashUpdate ? '(не ongoing, файл есть)' : '');
         }
     } else if (record_sl.s_status !== exist_rec.s_status) {
-        record_sl.file_p = exist_rec.file_p || ''; record_sl.id_f = exist_rec.id_f || '';
+        // v1.3.9: file_p/id_f из импорта не теряются, если в БД их нет
+        record_sl.file_p = exist_rec.file_p || record_sl.file_p; record_sl.id_f = exist_rec.id_f || record_sl.id_f;
         needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new status');
     } else {
-        record_sl.file_p = exist_rec.file_p || ''; record_sl.id_f = exist_rec.id_f || '';
+        record_sl.file_p = exist_rec.file_p || record_sl.file_p; record_sl.id_f = exist_rec.id_f || record_sl.id_f;
         needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new file');
     }
@@ -773,48 +833,57 @@ async function add_sl(exp_rec, noDownload = false, noStatusResolve = false) {
     await tx.done;
     
     if (record_sl.url_fh !== '' && needDownload) {
-        console.log('add_sl: нужна загрузка, url =', record_sl.url_fh);
         if (activeDownloadUrls.size >= S().MAX_CONCURRENT_DOWNLOADS) {
-            console.log('add_sl: лимит загрузок, ставим в очередь:', record_sl.url_fh);
+            _runStats.dlQueued++; // v1.3.9: в сводку, не в консоль
             await enqueueDownload(record_sl.url_s, record_sl.url_fh);
         } else {
+            _runStats.dlStarted++; // v1.3.9
             await startDownloadInternal(record_sl.url_s, record_sl.url_fh);
         }
         fsd_monitor.flag_dwd = true;
     } else {
-        fsd_monitor.flag_dwd = false;
+        // v1.3.9: флаг живёт, пока есть активные загрузки
+        fsd_monitor.flag_dwd = activeDownloadUrls.size > 0;
     }
 }
 
 async function handleDownloadComplete(delta, dwd) {
     const downloadItem = dwd[0];
-    const rec = await getRecordByDownloadUrl(downloadItem.url);
     downloadResumeAttempts.delete(delta.id);
     activeDownloadUrls.delete(downloadItem.url);
-    
-    let validation = { valid: true };
+
+    let rec = null;
+    let invalid = false;
+    // v1.3.9: чтение и запись записи в одной транзакции — read-modify-write
+    // больше не гоняется с add_sl; пустой filename не затирает известный file_p
+    const db = await getDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    rec = await tx.store.index('by_url_fh').get(downloadItem.url);
     if (rec) {
         const expectHtml = !!(rec.url_fh && rec.url_fh.includes('/cache/html/'));
-        validation = validateDownloadedFile(downloadItem, S(), { expectHtml });
-    }
-    
-    if (rec) {
+        const validation = validateDownloadedFile(downloadItem, S(), { expectHtml });
         if (!validation.valid) {
             log('warn', 'bg', 'валидация не пройдена для ' + rec.url_s + ': ' + validation.reason, validation);
             rec.s_status = 'invalid';
             rec.need_upd = false; // v1.3.7: invalid не должен переспрашиваться
-            await putRecord(rec);
-            await closePendingDownload(rec.url_s);
+            invalid = true;
+        } else {
+            const baseName = (downloadItem.filename || '').split(PATH_SEPARATOR_REGEX).pop();
+            if (baseName) rec.file_p = baseName; // v1.3.9: пустой filename не затирает file_p
+            rec.id_f = delta.id;
+        }
+        await tx.store.put(rec);
+    }
+    await tx.done;
+
+    if (rec) {
+        await closePendingDownload(rec.url_s);
+        if (invalid) {
             try { await chrome.downloads.removeFile(delta.id); } catch (e) { log('debug', 'bg', 'не удалось удалить невалидный файл', e); }
             try { await chrome.downloads.erase({ id: delta.id }); } catch (e) { log('debug', 'bg', 'не удалось удалить запись из истории загрузок', e); }
             fsd_monitor.c_e_s++;
             await updateMetrics(m => { m.total_invalid_files++; return m; });
         } else {
-            const fullPath = downloadItem.filename || '';
-            rec.file_p = fullPath.split(PATH_SEPARATOR_REGEX).pop();
-            rec.id_f = delta.id;
-            await putRecord(rec);
-            await closePendingDownload(rec.url_s);
             fsd_monitor.c_u_s++;
             await updateMetrics(m => { m.total_downloads_completed++; return m; });
             log('info', 'bg', 'загрузка завершена: ' + (rec.file_p || rec.url_s));
@@ -1010,8 +1079,13 @@ async function manageKeepalive() {
     } catch (e) { console.warn('manageKeepalive error:', e); }
 }
 
+const DATES_ISO_MIGRATED_KEY = 'fsd_dates_iso_migrated';
 async function normalizeDatesIfNeeded() {
     try {
+        // v1.3.9: полный скан БД при каждом пробуждении SW не нужен —
+        // все записиные пути уже пишут ISO; миграция выполняется один раз
+        const flag = await chrome.storage.local.get(DATES_ISO_MIGRATED_KEY);
+        if (flag[DATES_ISO_MIGRATED_KEY]) return;
         const db = await getDB();
         const tx = db.transaction(STORE_NAME, 'readwrite');
         let converted = 0;
@@ -1024,6 +1098,7 @@ async function normalizeDatesIfNeeded() {
             }
         }
         await tx.done;
+        await chrome.storage.local.set({ [DATES_ISO_MIGRATED_KEY]: true });
         if (converted > 0) console.log('миграция date_upd → ISO: преобразовано записей:', converted);
     } catch (e) { console.warn('миграция date_upd error:', e); }
 }
@@ -1047,8 +1122,14 @@ async function resetInvalidStatuses() {
     } catch (e) { console.warn('resetInvalidStatuses error:', e); }
 }
 
+const OLD_STATUS_MIGRATED_KEY = 'fsd_old_status_migrated';
 async function restoreOldStatuses() {
     try {
+        // v1.3.9: один раз — add_sl теперь сам пишет нормализованный статус;
+        // раньше каждое пробуждение SW сканило всю БД и меняло ongoing↔old,
+        // из-за чего записи «менялись сами» после перезапуска
+        const flag = await chrome.storage.local.get(OLD_STATUS_MIGRATED_KEY);
+        if (flag[OLD_STATUS_MIGRATED_KEY]) return;
         const db = await getDB();
         const tx = db.transaction(STORE_NAME, 'readwrite');
         let restored = 0;
@@ -1063,6 +1144,7 @@ async function restoreOldStatuses() {
             }
         }
         await tx.done;
+        await chrome.storage.local.set({ [OLD_STATUS_MIGRATED_KEY]: true });
         if (restored > 0) log('info', 'bg', 'миграция: восстановлен статус old у записей: ' + restored);
     } catch (e) { console.warn('restoreOldStatuses error:', e); }
 }
@@ -1092,7 +1174,11 @@ async function migrateNeedUpdIfNeeded() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name === ALARM_KEEPALIVE) {
         if (!hasActiveWork()) { await manageKeepalive(); return; }
-        if (currentlyProcessingUrl && currentlyProcessingStartedAt && (Date.now() - currentlyProcessingStartedAt) > STUCK_PROCESSING_THRESHOLD_MS) {
+        // v1.3.9: порог зависания не короче максимального 429-бэкоффа —
+        // легитимное ожидание не считается «застреванием» (в связке с
+        // heartbeat в fetchEpubApi)
+        const stuckThresholdMs = Math.max(STUCK_PROCESSING_THRESHOLD_MS, S().API_429_MAX_DELAY_MS + 60000);
+        if (currentlyProcessingUrl && currentlyProcessingStartedAt && (Date.now() - currentlyProcessingStartedAt) > stuckThresholdMs) {
             console.warn('KEEPALIVE: обнаружена застрявшая обработка, помечаем как timeout:', currentlyProcessingUrl);
             try {
                 await markErrorRecord(currentlyProcessingUrl, false);
@@ -1186,6 +1272,9 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
                     break;
                 case 'stop':
                     is_cancelled = true;
+                    _processGen++; // v1.3.9: все висящие ветки обработки — устаревшие
+                    if (_dlQueueFlushTimer) { clearTimeout(_dlQueueFlushTimer); _dlQueueFlushTimer = null; }
+                    _kaIdleCount = 0; // v1.3.9
                     // v1.3.7: разрешаем все висящие ожидания, чтобы fetchEpubApi мог завершиться
                     for (const [name, resolve] of pendingAlarmWaits.entries()) {
                         resolve({ kind: 'cancelled' });
@@ -1210,7 +1299,16 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
                     await clearAllState();
                     sendStatus();
                     break;
-                case 'fix': await fix(mess.arr_file_p); sendStatus(); break;
+                case 'fix':
+                    // v1.3.9: fix работает по снапшоту БД и гонялся с активными
+                    // загрузками, затирая свежие file_p — теперь только в простое
+                    if (fsd_monitor.fsd_status === 'work' || is_processing || activeDownloadUrls.size > 0) {
+                        log('warn', 'bg', 'fix отклонён: сначала дождитесь завершения обработки и загрузок');
+                        break;
+                    }
+                    await fix(mess.arr_file_p);
+                    sendStatus();
+                    break;
                 case 'read story':
                     chrome.tabs.create({ url: chrome.runtime.getURL('visual.html'), active: false });
                     break;
@@ -1233,7 +1331,10 @@ chrome.runtime.onMessage.addListener(function (mess, sender, sendResponse) {
                     break;
                 case 'update_settings':
                     if (mess.settings && typeof mess.settings === 'object') {
-                        await saveSettings(mess.settings);
+                        // v1.3.9: настройки уже сохранены страницей options — повторный
+                        // saveSettings убран (была двойная запись и два события
+                        // storage.onChanged); здесь только кэш и пересоздание alarms
+                        await refreshSettingsCache();
                         await setupAutoCheckAlarm();
                         keepaliveActive = false;
                         await manageKeepalive();

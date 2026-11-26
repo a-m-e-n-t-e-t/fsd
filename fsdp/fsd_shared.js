@@ -361,6 +361,7 @@ const LOG_FLUSH_DELAY_MS = 500;
 let _logQueue = [];
 let _logTimer = null;
 let _logWriting = false;
+let _logVersion = 0; // v1.3.9: защита от гонки «clearLog против летящего flushLog»
 
 export function log(level, source, message, details) {
     (async () => {
@@ -388,6 +389,7 @@ export async function flushLog() {
     _logWriting = true;
     const batch = _logQueue;
     _logQueue = [];
+    const version = _logVersion; // v1.3.9: фиксируем версию на момент старта записи
     try {
         const settings = _settingsCache || SETTINGS_DEFAULTS;
         const max = settings.MAX_LOG_ENTRIES || 200;
@@ -395,6 +397,8 @@ export async function flushLog() {
         const arr = result[STORAGE_KEY_LOG] || [];
         for (const e of batch) arr.push(e);
         if (arr.length > max) arr.splice(0, arr.length - max);
+        // v1.3.9: лог очищен, пока шла запись — не воскрешаем старые записи
+        if (version !== _logVersion) return;
         await chrome.storage.local.set({ [STORAGE_KEY_LOG]: arr });
     } catch (e) { if (typeof console !== 'undefined') console.error('log flush error:', e); } 
     finally {
@@ -408,6 +412,7 @@ export async function loadLog() {
     try { const result = await chrome.storage.local.get(STORAGE_KEY_LOG); return result[STORAGE_KEY_LOG] || []; } catch (e) { console.warn('loadLog error:', e); return []; }
 }
 export async function clearLog() {
+    _logVersion++; // v1.3.9: летящие flushLog обязаны отказаться от записи
     _logQueue = [];
     if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
     try { await chrome.storage.local.remove(STORAGE_KEY_LOG); } catch (e) { console.warn('clearLog error:', e); }

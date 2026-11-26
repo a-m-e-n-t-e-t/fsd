@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FSD — Fanfiction Story Downloader",
-  "version": "1.3.8",
+  "version": "1.3.9",
   "description": "Загрузка фанфиков с fichub.net: фоновая обработка очереди (MV3, alarms, state machine), pause/resume, metrics, настройки, авто-проверка обновлений, валидация файлов, persistent лог, тёмная тема",
   "permissions": [
     "downloads",

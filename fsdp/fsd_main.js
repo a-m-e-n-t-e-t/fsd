@@ -100,7 +100,7 @@ async function save_dl() { sendMsg({ type_mess: 'save_dl' }); }
 async function f_JSON_file() { sendMsg({ type_mess: 'JSON_file' }); }
 async function f_csv_file() { sendMsg({ type_mess: 'csv_file' }); }
 
-chrome.runtime.sendMessage({ type_mess: 'q_status' });
+chrome.runtime.sendMessage({ type_mess: 'q_status' }).catch(() => {}); // v1.3.9: SW может спать — не роняем uncaught
 
 const progress_story = document.querySelector('.progress_story');
 const progress_f = document.querySelector('.progress_f');
@@ -235,6 +235,9 @@ chrome.runtime.onMessage.addListener(function (mess) {
         if (button_resume) button_resume.disabled = !p.is_paused;
         if (button_pause && p.is_paused) button_pause.classList.add('active-pause');
         else if (button_pause) button_pause.classList.remove('active-pause');
+        // v1.3.9: fix заблокирован во время обработки/загрузок (защита БД)
+        const button_fix = document.querySelector('.fsd_fix');
+        if (button_fix) button_fix.disabled = (p.fsd_status === 'work' || (p.active_downloads || 0) > 0);
     })();
     return false; // v1.3.7: fire-and-forget, не держим канал открытым
 });
