@@ -15,7 +15,7 @@ function S() { return getCachedSettings(); }
 
 const STATUS_BATCH = 100;
 const PATH_SEPARATOR_REGEX = /[\/\\]/;
-const CLEAN_NUMBER_SUFFIX_REGEX = /\s*(\d+)/g;
+const CLEAN_NUMBER_SUFFIX_REGEX = /\s*\(\d+\)/g;
 const FICHUB_API_BASE = 'https://fichub.net/api/v0/epub?q=';
 const API_MAX_RETRIES = 60;
 const API_DEFAULT_RETRY_DELAY_SEC = 5;

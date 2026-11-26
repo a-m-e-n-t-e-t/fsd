@@ -322,12 +322,12 @@ export async function saveSettings(settings) {
             const defType = typeof def;
             const valType = typeof val;
             if (defType === 'number') {
-                if (valType === 'number' && !isNaN(val)) {
+                if (valType === 'number' && !isNaN(val) && val >= 0) {
                     const limits = SETTINGS_LIMITS[key];
                     if (limits) {
                         valid[key] = Math.max(limits.min, Math.min(limits.max, val));
                     } else {
-                        valid[key] = Math.max(0, val);
+                        valid[key] = val;
                     }
                 } else {
                     valid[key] = def;
