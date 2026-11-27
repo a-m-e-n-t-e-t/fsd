@@ -1,11 +1,11 @@
 {
   "name": "fsd-extension",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "FSD — Fanfiction Story Downloader (Chrome MV3 extension)",
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node tests/unit-shared.test.mjs && node tests/integration-bg.test.mjs && node tests/migration.test.mjs && node tests/v133-regress.test.mjs && node tests/optimization.test.mjs && node tests/v139-regress.test.mjs && node tests/v140-regress.test.mjs && node tests/save-export.test.mjs"
+    "test": "node tests/unit-shared.test.mjs && node tests/integration-bg.test.mjs && node tests/migration.test.mjs && node tests/v133-regress.test.mjs && node tests/optimization.test.mjs && node tests/v139-regress.test.mjs && node tests/v140-regress.test.mjs && node tests/save-export.test.mjs && node tests/ui-sync.test.mjs"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.2.8"
