@@ -1,5 +1,5 @@
 'use strict';
-import { STORE_NAME, getDB, formatDate } from './fsd_shared.js';
+import { STORE_NAME, getDB } from './fsd_shared.js';
 
 function escapeCsv(value) {
     if (value === null || value === undefined) return '';
