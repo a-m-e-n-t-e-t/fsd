@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node tests/unit-shared.test.mjs && node tests/integration-bg.test.mjs && node tests/migration.test.mjs && node tests/v133-regress.test.mjs && node tests/optimization.test.mjs && node tests/v139-regress.test.mjs && node tests/v140-regress.test.mjs && node tests/save-export.test.mjs && node tests/ui-sync.test.mjs"
+    "test": "node tests/unit-shared.test.mjs && node tests/integration-bg.test.mjs && node tests/migration.test.mjs && node tests/v133-regress.test.mjs && node tests/optimization.test.mjs && node tests/v139-regress.test.mjs && node tests/v140-regress.test.mjs && node tests/save-export.test.mjs && node tests/ui-sync.test.mjs && node tests/ui-smoke.test.mjs"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.2.8"
