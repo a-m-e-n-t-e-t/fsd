@@ -145,7 +145,10 @@ await waitFor('keepalive погашен', () => !chromeMock.alarms._map.has('fsd
     check('run1: статус ongoing взят из meta (не regex)', r1b.s_status === 'ongoing');
     check('run1: date_upd — ISO-строка из meta.updated', r1b.date_upd === '2026-01-15T10:00:00.000Z');
     check('run1: url_fh без query', r1b.url_fh === 'https://fichub.net/cache/html/abc123');
-    check('run1: 404-запись помечена not_found', r2 && r2.s_status === 'not_found');
+    check('run1: 404-запись помечена s_att=not_found (v1.4.0: домен попытки)',
+        r2 && r2.s_att === 'not_found');
+    check('run1: у 404-записи статус истории не выдуман (s_status=\'\')',
+        r2 && r2.s_status === '' && r2.need_upd === true);
     check('run1: c_e_s=1 (счётчик ошибок работает)',
         await waitFor('c_e_s=1', () => (chromeMock.storage.local._raw('fsd_state') || {}).c_e_s === 1));
     check('run1: очередь в storage очищена',

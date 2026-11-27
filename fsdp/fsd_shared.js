@@ -60,6 +60,8 @@ export class t_rec_sl {
         this.id_f = '';
         this.hash_f = '';
         this.need_upd = false; // v1.3.7: флаг необходимости обновления
+        this.s_att = '';   // v1.4.0: статус попытки: '' | 'ok' | 'timeout' | 'not_found' | 'invalid'
+        this.t_att = 0;    // v1.4.0: время последней попытки (epoch ms)
     }
 }
 
@@ -104,24 +106,49 @@ export function parseDate(value) {
     return isNaN(d.getTime()) ? new Date(0) : d;
 }
 
-// v1.3.7: need_upd — явный флаг «перепроверить при следующем запуске».
-export function computeNeedUpd(s_status, date_upd) {
-    if (s_status === 'timeout' || s_status === 'not_found' || s_status === '') return true;
+// v1.4.0: s_status — только домен истории ('' | 'ongoing' | 'completed' | сырые
+// строки фикхаба). Всё, что касается попытки обращения/скачивания, живёт в
+// s_att. До v1.4.0 эти домены смешивались в одном поле, из-за чего писатели
+// статуса попытки затирали статус истории (not_found поверх completed и т.п.).
+export const ATTEMPT_STATUSES = new Set(['ok', 'timeout', 'not_found', 'invalid']);
+
+// v1.4.0: единая конвенция need_upd — вычисляется ТОЛЬКО из статуса попытки и
+// свежести ongoing-истории. «Заброшенность» (раньше сохраняемый статус
+// 'old') больше не хранится в БД — она всегда выводится из даты на лету.
+export function computeNeedUpd(s_att, s_status, date_upd) {
+    if (s_att === 'invalid') return false; // диагноз файла — повторный запрос API ничего не изменит
+    if (s_att !== 'ok') return true;       // '' (не проверяли) | timeout | not_found — перепроверить
+    // попытка успешна: перепроверять только активные ongoing на новые главы
     if (s_status === 'ongoing') {
         const parsed = parseDate(date_upd);
-        if (Number(parsed) === 0) return true;
+        if (Number(parsed) === 0) return true; // дата неизвестна — перестраховаться
         return (Date.now() - Number(parsed)) <= FIVE_YEARS_MS;
     }
     return false;
 }
 
-export function resolveStatus(s_status, date_upd) {
-    if (s_status === 'ongoing' || s_status === '' || s_status === 'timeout' || s_status === 'not_found') {
-        const parsed = parseDate(date_upd);
-        if (Number(parsed) !== 0 && (Date.now() - Number(parsed)) > FIVE_YEARS_MS)
-            return 'old';
-    }
-    return s_status;
+// v1.4.0: «заброшенность» ongoing-истории выводится из даты на лету (раньше
+// это был хранимый статус 'old'). Возвращает true ТОЛЬКО для ongoing с
+// известной датой старше 5 лет: у заброшенных историй изменение hash —
+// почти наверняка артефакт регенерации zip фикхабом, а не новые главы.
+// Дата неизвестна → false (считаем активной, перестраховываемся).
+export function isStaleOngoing(s_status, date_upd) {
+    if (s_status !== 'ongoing') return false;
+    const parsed = parseDate(date_upd);
+    if (Number(parsed) === 0) return false;
+    return (Date.now() - Number(parsed)) > FIVE_YEARS_MS;
+}
+
+// v1.4.0: разбор «наследуемого» смешанного статуса из старых версий/бэкапов:
+// статусы попытки переезжают в s_att, эвристика 'old' разворачивается обратно
+// в 'ongoing' (дата обновления и так хранится в записи).
+export function splitLegacyStatus(s_status) {
+    const raw = String(s_status || '');
+    if (raw === 'timeout' || raw === 'not_found' || raw === 'invalid')
+        return { s_status: '', s_att: raw };
+    if (raw === 'old')
+        return { s_status: 'ongoing', s_att: '' };
+    return { s_status: raw, s_att: '' };
 }
 
 const HOST_RULES = {

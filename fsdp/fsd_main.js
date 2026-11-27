@@ -77,6 +77,8 @@ async function add_db_f_json(file) {
         rec.name = item.name || '';
         rec.date_upd = item.date_upd || new Date(0);
         rec.s_status = item.s_status || '';
+        rec.s_att = item.s_att || '';   // v1.4.0: статус попытки из бэкапа
+        rec.t_att = item.t_att || 0;    // v1.4.0: время последней попытки
         rec.url_fh = item.url_fh || '';
         rec.file_p = item.file_p || '';
         rec.id_f = item.id_f || '';

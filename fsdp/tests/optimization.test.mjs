@@ -216,7 +216,7 @@ await waitFor('таймаут-alarm создан', () =>
         chromeMock.downloads._erased.has(dl888));
     const r = await getRec(KEY888);
     check('таймаут: статус записи сохранён, file_p сброшен для перекачки',
-        r && r.s_status === 'old' && r.file_p === '');
+        r && r.s_status === 'ongoing' && r.file_p === '');
 }
 
 // === 4. Fail-fast постоянных ошибок + свободный слот после таймаута ===
@@ -242,8 +242,13 @@ await chromeMock.runtime.sendMessage({
     });
     await waitFor('запись 999 помечена timeout', async () => {
         const r = await getRec(KEY999);
-        return !!(r && r.s_status === 'timeout');
+        return !!(r && r.s_att === 'timeout');
     });
+    {
+        const r = await getRec(KEY999);
+        check('fail-fast: статус истории не тронут (v1.4.0: домен попытки)',
+            r && r.s_status === 'ongoing');
+    }
     const hasResumeAlarm = [...chromeMock.alarms._map.keys()]
         .some(n => n.startsWith('fsd_resume_dl_'));
     check('fail-fast: resume-alarm НЕ создан для постоянной ошибки', !hasResumeAlarm);
@@ -299,7 +304,7 @@ await chromeMock.runtime.sendMessage({
 });
 await waitFor('загрузка 121 началась и обработана', async () => {
     const r = await getRec(KEY121);
-    return !!(r && r.s_status === 'invalid');
+    return !!(r && r.s_att === 'invalid');
 });
 {
     const dl121 = lastDlId();
@@ -364,6 +369,8 @@ await waitFor('fix: ключ 111 нормализован', async () => {
     check('fix: суффикс " (N)" вычищен', r3 && r3.file_p === 'ff_333.zip');
     check('fix: дубликаты file_p очищены у обеих записей',
         r4 && r4.file_p === '' && r5 && r5.file_p === '');
+    check('fix: legacy-статусы расщеплены (v1.4.0: old → ongoing, файл ⟹ s_att=ok)',
+        r3 && r3.s_status === 'ongoing' && r3.s_att === 'ok');
 }
 // второй прогон с непустым списком файлов — фильтр через Set
 {
@@ -421,6 +428,8 @@ console.log('\n[7] массовые ошибки API: троттлинг кон�
         const r1 = await getRec('https://www.fanfiction.net/s/55500001/');
         check('[7] запись помечена на повторную проверку (need_upd=true)',
             !!(r1 && r1.need_upd === true));
+        check('[7] v1.4.0: upstream-сбой — домен попытки (s_att=timeout), история не тронута',
+            !!(r1 && r1.s_att === 'timeout' && r1.s_status === 'ongoing'));
         await shared.flushMetrics();
         const mAfter = (chromeMock.storage.local._raw('fsd_metrics') || {}).total_urls_timeout || 0;
         check('[7] метрика total_urls_timeout: +30 за прогон', mAfter - mBefore === 30);

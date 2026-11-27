@@ -5,7 +5,7 @@ let sl_list = [];
 let sl_i = 0;
 let filtered_list = null; // Отфильтрованный список после поиска
 let currentRecord = new t_rec_sl();
-const RECORD_FIELDS = ['url_s', 'name', 'date_upd', 's_status', 'url_fh', 'file_p', 'id_f'];
+const RECORD_FIELDS = ['url_s', 'name', 'date_upd', 's_status', 's_att', 't_att', 'url_fh', 'file_p', 'id_f'];
 
 // Активный список (filtered_list если задан, иначе sl_list)
 function activeList() {
@@ -47,7 +47,10 @@ async function show_rec(url) {
         for (const field of RECORD_FIELDS) {
             const el = document.querySelector(`[data-field="${field}"]`);
             if (!el) continue;
-            el.textContent = field === 'date_upd' ? formatDate(currentRecord[field]) : (currentRecord[field] || '—');
+            // v1.4.0: t_att (epoch ms) и date_upd форматируются как даты
+            el.textContent = (field === 'date_upd' || field === 't_att')
+                ? formatDate(currentRecord[field])
+                : (currentRecord[field] || '—');
         }
         updateNavButtons();
     } catch (e) {

@@ -1,9 +1,12 @@
 // Регрессионный тест fsd_background.js v1.3.3 (полный цикл через моки chrome API):
+//  v1.4.0: статус 'old' больше не существует — фикстуры посылают его как
+//  legacy-вход (проверка расщепления), а «заброшенность» выводится из даты:
+//  DATE_OLD (>5 лет) = заброшенная ongoing, DATE_RECENT = активная ongoing.
 //  1. Windows-сценарий: zip от fichub приходит как application/x-zip-compressed
 //     (баг из лога пользователя: unexpected_mime → invalid → вечная перекачка)
-//  2. silentHashUpdate: hash изменился, но old + файл есть → БЕЗ перекачки
-//  3. old + файла нет → перекачка по hash
-//  4. ongoing + hash изменился → перекачка (реальное обновление)
+//  2. silentHashUpdate: hash изменился, но заброшенная ongoing + файл есть → БЕЗ перекачки
+//  3. заброшенная ongoing + файла нет → перекачка по hash
+//  4. активная ongoing + hash изменился → перекачка (реальное обновление)
 //  5. noDownload-импорт + изменившийся hash → без загрузки, файл не тронут
 //  6. негативный контроль: неизвестный MIME по-прежнему отбраковывается
 'use strict';
@@ -96,7 +99,8 @@ await waitFor('загрузка завершена', async () => {
     check('win: загрузка выполнена', dl() === 1);
     check('win: файл принят (file_p установлен)', r && r.file_p === 'abc123.zip');
     check('win: id_f привязан', r && r.id_f === 1);
-    check('win: запись НЕ помечена invalid (главный баг v1.3.2)', r && r.s_status === 'old');
+    check('win: запись НЕ помечена invalid (главный баг v1.3.2; v1.4.0: домен попытки)',
+        r && r.s_att === 'ok' && r.s_status === 'ongoing');
     check('win: hash из API сохранён', r && r.hash_f === 'h1');
     await shared.flushMetrics();
     const m = chromeMock.storage.local._raw('fsd_metrics');
@@ -107,8 +111,8 @@ await waitFor('загрузка завершена', async () => {
         !logArr.some(e => e.message.includes('валидация не пройдена')));
 }
 
-// === 2. silentHashUpdate: old + файл есть, hash изменился ===
-console.log('\n[2] hash изменился, old + файл есть → без перекачки (v1.3.3)');
+// === 2. silentHashUpdate: заброшенная ongoing (legacy 'old') + файл есть, hash изменился ===
+console.log('\n[2] hash изменился, заброшенная ongoing + файл есть → без перекачки (v1.3.3 + v1.4.0)');
 await chromeMock.runtime.sendMessage({
     type_mess: 'add_url', fs: 2,
     exp_rec: { url_s: KEY1, url_fh: URL_FH1, s_status: 'old', date_upd: DATE_OLD, hash_f: 'h2' },
@@ -120,13 +124,14 @@ await new Promise(r => setTimeout(r, 300)); // даём время на случ
     check('silent: файл не тронут (file_p прежний)', r && r.file_p === 'abc123.zip');
     check('silent: id_f прежний', r && r.id_f === 1);
     check('silent: новый hash запомнен', r && r.hash_f === 'h2');
-    check('silent: s_status прежний', r && r.s_status === 'old');
+    check('silent: s_status прежний (заброшенная ongoing, а не invalid-пинг-понг)',
+        r && r.s_status === 'ongoing' && r.s_att === 'ok');
     check('silent: в консоли — «new hash — без перекачки»',
         consoleLines.some(l => l.includes('new hash — без перекачки')));
 }
 
-// === 3. old + файла нет → перекачка по hash ===
-console.log('\n[3] hash изменился, old, файл потерян → перекачка');
+// === 3. заброшенная ongoing + файла нет → перекачка по hash ===
+console.log('\n[3] hash изменился, заброшенная ongoing, файл потерян → перекачка');
 {
     const db = await getDB();
     const rec = await db.get(STORE_NAME, KEY1);
@@ -203,7 +208,7 @@ await chromeMock.runtime.sendMessage({
 });
 await waitFor('невалидная загрузка обработана', async () => {
     const r = await getRec(KEY2);
-    return !!(r && r.s_status === 'invalid');
+    return !!(r && r.s_att === 'invalid');
 });
 {
     const r = await getRec(KEY2);
@@ -211,7 +216,8 @@ await waitFor('невалидная загрузка обработана', asyn
     const badId = chromeMock.downloads._downloadCalls[dl() - 1].id;
     const item = chromeMock.downloads._items.get(badId);
     check('контроль: загрузка выполнена', dl() === 5);
-    check('контроль: запись помечена invalid', r && r.s_status === 'invalid');
+    check('контроль: запись помечена s_att=invalid, статус истории не тронут (v1.4.0)',
+        r && r.s_att === 'invalid' && r.s_status === 'ongoing' && r.need_upd === false);
     check('контроль: невалидный файл удалён с диска', item && item.removed === true);
     await shared.flushMetrics();
     await shared.flushLog(); // log() пишет пачками с задержкой — принудительный сброс

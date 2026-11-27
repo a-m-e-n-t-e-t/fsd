@@ -56,7 +56,7 @@ function downloadBlob(content, filename, mimeType) {
     }, 5000);
 }
 
-const CSV_HEADERS = ['url', 'title', 'description', 'collections', 'notes', 'tags', 'date_created', 'date_modified'];
+const CSV_HEADERS = ['url', 'title', 'description', 'collections', 'notes', 'tags', 'attempt_status', 'date_created', 'date_modified'];
 
 function recordToCsvRow(r) {
     const na = name_and_author(r.file_p);
@@ -67,7 +67,9 @@ function recordToCsvRow(r) {
         description: escapeCsv(r.name || ''),
         collections: escapeCsv(na.author_s || ''),
         notes: escapeCsv(r.url_fh || ''),
+        // v1.4.0: два домена статусов — история (tags) и попытка (attempt_status)
         tags: escapeCsv(r.s_status || ''),
+        attempt_status: escapeCsv(r.s_att || ''),
         date_created: ts,
         date_modified: ts,
     };

@@ -2,7 +2,7 @@
 import {
     FICHUB_HOST, STORE_NAME, MAX_RESUME_ATTEMPTS, FIVE_YEARS_MS,
     t_rec_sl, t_monitor, parseDate, normalize, buildFileName,
-    resolveStatus, computeNeedUpd, getDB, saveMonitorState, loadMonitorState,
+    splitLegacyStatus, ATTEMPT_STATUSES, computeNeedUpd, isStaleOngoing, getDB, saveMonitorState, loadMonitorState,
     saveQueueArr, saveRuntimeState, loadRuntimeState, saveFetchState,
     loadFetchState, clearAllFetchStates, saveDownloadQueue, loadDownloadQueue,
     clearDownloadQueue, loadMetrics, updateMetrics, saveMetrics, flushMetrics,
@@ -226,7 +226,7 @@ function sendStatus() {
 }
 
 function audit_fields(v) { if (v === undefined || v === null) return ''; return v; }
-const RECORD_FIELDS = ['url_s', 'name', 's_status', 'date_upd', 'url_fh', 'file_p', 'id_f', 'hash_f', 'need_upd'];
+const RECORD_FIELDS = ['url_s', 'name', 's_status', 's_att', 't_att', 'date_upd', 'url_fh', 'file_p', 'id_f', 'hash_f', 'need_upd'];
 
 function recordsDiffer(a, b) {
     return RECORD_FIELDS.some(f => a[f] !== b[f]);
@@ -396,11 +396,14 @@ async function markErrorRecord(url_s, isNotFound) {
         rec = new t_rec_sl();
         rec.url_s = normalize(url_s);
     }
-    // v1.3.9: not_found затирает статус только у записей без скачанного
-    // файла. Транзитный 404 fichub больше не превращает «completed» в
-    // «not_found» у скачанной истории; перепроверку гарантирует need_upd.
+    // v1.4.0: ошибка обращения — домен попытки (s_att), статус истории
+    // (s_status) больше не затирается ничем; file_p-защита не нужна —
+    // нечему конфликтовать. Если в записи ещё живёт смешанный
+    // legacy-статус — расщепляем (инвариант: БД не хранит смешанные)
+    rec.s_status = splitLegacyStatus(rec.s_status || '').s_status;
+    rec.s_att = isNotFound ? 'not_found' : 'timeout';
+    rec.t_att = Date.now();
     rec.need_upd = true;
-    if (isNotFound && rec.file_p === '') rec.s_status = 'not_found';
     await tx.store.put(rec);
     await tx.done;
 }
@@ -427,6 +430,7 @@ async function processUrl(url_s) {
             await add_sl({
                 url_s: url_s, url_fh: result.url_fh, s_status: result.s_status,
                 date_upd: result.date_upd, file_p: '', id_f: '', hash_f: result.hash_f || '',
+                s_att: 'ok', t_att: Date.now(), // v1.4.0: успешный ответ API — факт попытки
             }, false);
         }
         await updateMetrics(m => {
@@ -483,7 +487,13 @@ async function fix(arr_file_p = []) {
         const s_name = buildFileName(record_sl.url_s);
         if (record_sl.name !== s_name) record_sl.name = s_name;
         record_sl.date_upd = parseDate(original.date_upd).toISOString();
-        record_sl.s_status = resolveStatus(audit_fields(original.s_status), record_sl.date_upd);
+        // v1.4.0: расщепление смешанного статуса вместо resolveStatus —
+        // 'old' больше не существует как хранимый статус (развёрнут в
+        // 'ongoing' + дата), статусы попытки едут в s_att
+        const legacy = splitLegacyStatus(audit_fields(original.s_status));
+        record_sl.s_status = legacy.s_status;
+        record_sl.s_att = ATTEMPT_STATUSES.has(original.s_att) ? original.s_att : legacy.s_att;
+        record_sl.t_att = Number(original.t_att) > 0 ? Number(original.t_att) : 0;
         record_sl.url_fh = audit_fields(original.url_fh);
         record_sl.file_p = audit_fields(original.file_p);
         if (record_sl.file_p !== '') {
@@ -504,7 +514,9 @@ async function fix(arr_file_p = []) {
         }
         record_sl.id_f = original.id_f || '';
         record_sl.hash_f = audit_fields(original.hash_f);
-        record_sl.need_upd = typeof original.need_upd === 'boolean' ? original.need_upd : computeNeedUpd(record_sl.s_status, record_sl.date_upd);
+        // v1.4.0: инвариант «файл есть ⟹ попытка успешна» (как в миграции)
+        if (record_sl.s_att === '' && record_sl.file_p !== '') record_sl.s_att = 'ok';
+        record_sl.need_upd = typeof original.need_upd === 'boolean' ? original.need_upd : computeNeedUpd(record_sl.s_att, record_sl.s_status, record_sl.date_upd);
         
         if (record_sl.file_p !== '') filePCounts.set(record_sl.file_p, (filePCounts.get(record_sl.file_p) || 0) + 1);
         entries.push({ oldKey, record: record_sl, original });
@@ -532,6 +544,10 @@ async function fix(arr_file_p = []) {
                 merged.date_upd = (d_old > d_new ? d_old : d_new).toISOString();
                 merged.name = change.record.name || exist_new.name;
                 merged.s_status = change.record.s_status || exist_new.s_status;
+                // v1.4.0: домен попытки — приоритет непустому значению,
+                // t_att — самый свежий
+                merged.s_att = change.record.s_att || exist_new.s_att || '';
+                merged.t_att = Math.max(Number(change.record.t_att) || 0, Number(exist_new.t_att) || 0);
                 merged.url_fh = change.record.url_fh || exist_new.url_fh;
                 merged.file_p = change.record.file_p || exist_new.file_p;
                 merged.id_f = change.record.id_f || exist_new.id_f;
@@ -560,7 +576,10 @@ async function create_arr_sl(regim) {
         if (regim === 0) {
             array_sl.push(v.url_s);
         } else if (regim === 1) {
-            const needsUpdate = !v.url_fh || (!v.file_p && v.s_status !== 'invalid') || v.need_upd === true;
+            // v1.4.0: фильтр «Загрузить» — по домену попытки (s_att):
+            // нет ссылки фикхуба; файл не скачан (кроме диагноза invalid —
+            // повторный запрос ничего не изменит); помечено к перепроверке
+            const needsUpdate = !v.url_fh || (!v.file_p && (v.s_att || '') !== 'invalid') || v.need_upd === true;
             if (needsUpdate) array_sl.push(v.url_s);
         }
         if (array_sl.length % STATUS_BATCH === 0) {
@@ -757,16 +776,22 @@ async function add_sl(exp_rec, noDownload = false) {
     }
     const parsed_date = parseDate(exp_rec.date_upd);
     record_sl.date_upd = parsed_date.toISOString();
-    // v1.3.9: статус всегда нормализуется resolveStatus — раньше «сырой»
-    // ongoing из processUrl переписывался обратно миграцией restoreOldStatuses
-    // при каждом старте SW (пинг-понг статусов в БД)
-    record_sl.s_status = resolveStatus(exp_rec.s_status || '', parsed_date);
+    // v1.4.0: s_status — только домен истории (сырой статус фикхаба).
+    // Смешанные статусы из старых версий/бэкапов расщепляются:
+    // 'timeout'/'not_found'/'invalid' едут в s_att, 'old' разворачивается
+    // в 'ongoing' (дата обновления и так хранится в записи)
+    const legacy = splitLegacyStatus(exp_rec.s_status || '');
+    record_sl.s_status = legacy.s_status;
+    record_sl.s_att = ATTEMPT_STATUSES.has(exp_rec.s_att) ? exp_rec.s_att : legacy.s_att;
+    record_sl.t_att = Number(exp_rec.t_att) > 0 ? Number(exp_rec.t_att) : 0;
     record_sl.url_fh = exp_rec.url_fh || '';
     record_sl.name = buildFileName(record_sl.url_s);
     record_sl.file_p = exp_rec.file_p || '';
     record_sl.id_f = exp_rec.id_f || '';
     record_sl.hash_f = exp_rec.hash_f || '';
-    record_sl.need_upd = computeNeedUpd(record_sl.s_status, record_sl.date_upd); // v1.3.7
+    // предварительный расчёт (для reasons); финальный — перед put,
+    // после того как ветки ниже могли изменить поля
+    record_sl.need_upd = computeNeedUpd(record_sl.s_att, record_sl.s_status, record_sl.date_upd);
 
     const db = await getDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -783,6 +808,7 @@ async function add_sl(exp_rec, noDownload = false) {
     if (hashNew) reasons.push('первый hash');
     if (exist_rec.file_p === '') reasons.push('нет file_p');
     if (record_sl.s_status !== exist_rec.s_status) reasons.push('статус: ' + exist_rec.s_status + ' → ' + record_sl.s_status);
+    if (record_sl.s_att !== (exist_rec.s_att || '')) reasons.push('s_att: ' + (exist_rec.s_att || '') + ' → ' + record_sl.s_att);
     if (record_sl.need_upd !== !!exist_rec.need_upd) reasons.push('need_upd: ' + !!exist_rec.need_upd + ' → ' + record_sl.need_upd);
 
     const needsUpdate = reasons.length > 0;
@@ -792,6 +818,15 @@ async function add_sl(exp_rec, noDownload = false) {
     }
     
     if (!needsUpdate) {
+        // v1.4.0: «touch» — существенных изменений нет, но живая проверка
+        // фиксирует факт попытки (t_att) для UI и будущих политик; без
+        // счётчика dbUpdated и без шума в логе
+        if (record_sl.t_att > 0 && record_sl.t_att > (Number(exist_rec.t_att) || 0)) {
+            exist_rec.s_att = record_sl.s_att;
+            exist_rec.t_att = record_sl.t_att;
+            exist_rec.need_upd = record_sl.need_upd;
+            await tx.store.put(exist_rec);
+        }
         await tx.done;
         // v1.3.9: не сбрасывать флаг загрузки, запущенной другим путём
         // (раньше add_url во время активной загрузки обнулял flag_dwd и
@@ -810,7 +845,11 @@ async function add_sl(exp_rec, noDownload = false) {
         if (!noDownload) { record_sl.file_p = ''; record_sl.id_f = ''; needDownload = true; }
         console.log('new url');
     } else if (hashChanged) {
-        const silentHashUpdate = record_sl.s_status !== 'ongoing' && exist_rec.file_p !== '';
+        // v1.4.0: «не активна» = completed/без статуса ИЛИ заброшенная ongoing
+        // (выводится из даты на лету — раньше это был статус 'old').
+        // У активных историй изменение hash — новые главы, перекачиваем;
+        // у остальных — артефакт регенерации zip фикхабом, тихо обновляем.
+        const silentHashUpdate = (record_sl.s_status !== 'ongoing' || isStaleOngoing(record_sl.s_status, record_sl.date_upd)) && exist_rec.file_p !== '';
         if (!noDownload && !silentHashUpdate) {
             record_sl.file_p = ''; record_sl.id_f = ''; needDownload = true;
             console.log('new hash — перекачка');
@@ -828,6 +867,12 @@ async function add_sl(exp_rec, noDownload = false) {
         needDownload = !noDownload && (exist_rec.file_p === '');
         console.log('new file');
     }
+    // v1.4.0: инвариант «файл есть ⟹ попытка успешна» (как в миграции):
+    // legacy-вход без s_att, но с восстановленным файлом — попытка была успешной
+    if (record_sl.s_att === '' && record_sl.file_p !== '') record_sl.s_att = 'ok';
+    // v1.4.0: финальный пересчёт — ветки выше могли изменить file_p/s_att;
+    // need_upd всегда согласован с фактически записываемым состоянием
+    record_sl.need_upd = computeNeedUpd(record_sl.s_att, record_sl.s_status, record_sl.date_upd);
     
     await tx.store.put(record_sl);
     await tx.done;
@@ -864,13 +909,24 @@ async function handleDownloadComplete(delta, dwd) {
         const validation = validateDownloadedFile(downloadItem, S(), { expectHtml });
         if (!validation.valid) {
             log('warn', 'bg', 'валидация не пройдена для ' + rec.url_s + ': ' + validation.reason, validation);
-            rec.s_status = 'invalid';
+            // v1.4.0: невалидный файл — домен попытки (s_att='invalid'),
+            // статус истории не трогаем; файл-мусор удалён ниже — обнуляем
+            // ссылки на него
+            rec.s_att = 'invalid';
+            rec.t_att = Date.now();
+            rec.file_p = '';
+            rec.id_f = '';
             rec.need_upd = false; // v1.3.7: invalid не должен переспрашиваться
             invalid = true;
         } else {
             const baseName = (downloadItem.filename || '').split(PATH_SEPARATOR_REGEX).pop();
             if (baseName) rec.file_p = baseName; // v1.3.9: пустой filename не затирает file_p
             rec.id_f = delta.id;
+            // v1.4.0: успешная загрузка — попытка ok; need_upd согласован
+            // (раньше после invalid→ok флаг навсегда оставался false)
+            rec.s_att = 'ok';
+            rec.t_att = Date.now();
+            rec.need_upd = computeNeedUpd('ok', rec.s_status, rec.date_upd);
         }
         await tx.store.put(rec);
     }
@@ -909,7 +965,9 @@ async function handleDownloadInterrupted(delta, dwd) {
         activeDownloadUrls.delete(dwd[0].url);
         const rec = await getRecordByDownloadUrl(dwd[0].url);
         if (rec) {
-            rec.s_status = notFoundError ? 'not_found' : 'timeout';
+            // v1.4.0: ошибка загрузки — домен попытки; статус истории цел
+            rec.s_att = notFoundError ? 'not_found' : 'timeout';
+            rec.t_att = Date.now();
             rec.need_upd = true; // v1.3.7: ошибка загрузки — перепроверить
             await putRecord(rec);
             await closePendingDownload(rec.url_s);
@@ -1037,16 +1095,28 @@ async function runAutoCheck() {
         const array_sl = [];
         const tx = db.transaction(STORE_NAME, 'readonly');
         const index = tx.store.index('by_date_upd');
-        const cutoff = new Date(Date.now() - FIVE_YEARS_MS).toISOString();
-        // v1.3.7: lowerBound('') вместо new Date(0) для корректной работы со строковыми ключами
-        for await (const cursor of index.lowerBound('')) {
+        // v1.4.0: инверсия исправлена и починен сам курсор. Цель
+        // автопроверки — новые главы АКТИВНЫХ ongoing-историй. Раньше
+        // (v1.3.7–v1.3.9) нижняя граница читалась как верхняя И вызов
+        // index.lowerBound(...) не существует в обёртке idb — автопроверка
+        // падала с TypeError при каждом срабатывании и не работала никогда.
+        // Теперь: полный проход индекса с фильтром свежести на месте.
+        const cutoffMs = Date.now() - FIVE_YEARS_MS;
+        for await (const cursor of index) {
             const v = cursor.value;
             if (!v) continue;
-            if (!v.date_upd || v.date_upd > cutoff) break;
-            if (v.s_status === 'old' || v.s_status === 'ongoing') array_sl.push(v.url_s);
+            if (v.s_status !== 'ongoing') continue;
+            // дата неизвестна или старше 5 лет — заброшена, не теребим
+            // каждые 24ч; её перепроверит ручная «Загрузить»/«проверить все»
+            const upd = parseDate(v.date_upd);
+            if (Number(upd) === 0 || Number(upd) < cutoffMs) continue;
+            // мёртвые ссылки и битые файлы — тоже не автопроверка
+            const att = v.s_att || '';
+            if (att === 'not_found' || att === 'invalid') continue;
+            array_sl.push(v.url_s);
         }
         await tx.done;
-        log('info', 'bg', 'auto-check: выбрано старых незакрытых историй: ' + array_sl.length);
+        log('info', 'bg', 'auto-check: выбрано активных ongoing-историй: ' + array_sl.length);
         if (array_sl.length === 0) return;
         await startQueue(array_sl);
     } catch (e) { log('error', 'bg', 'auto-check: ошибка', e); }
@@ -1103,50 +1173,50 @@ async function normalizeDatesIfNeeded() {
     } catch (e) { console.warn('миграция date_upd error:', e); }
 }
 
-async function resetInvalidStatuses() {
+// v1.4.0: одноразовая миграция разделения доменов статуса. До v1.4.0
+// s_status смешивал статус истории и статус попытки; теперь:
+//   - 'timeout'/'not_found'/'invalid' переезжают в s_att (s_status → ''),
+//     история не считается потерянной — её вернёт следующий успешный ответ
+//     API (need_upd это гарантирует)
+//   - эвристика 'old' разворачивается в 'ongoing': «заброшенность» больше
+//     не хранимое состояние, а вывод из date_upd на лету
+//   - записям с file_p и без статуса попытки присваивается s_att='ok'
+//     (файл на диске есть — попытка была успешной)
+const STATUS_SPLIT_MIGRATED_KEY = 'fsd_status_split_migrated';
+async function migrateStatusSplitIfNeeded() {
     try {
+        const flag = await chrome.storage.local.get(STATUS_SPLIT_MIGRATED_KEY);
+        if (flag[STATUS_SPLIT_MIGRATED_KEY]) return;
         const db = await getDB();
         const tx = db.transaction(STORE_NAME, 'readwrite');
-        let reset = 0;
-        for await (const cursor of tx.store) {
-            const v = cursor.value;
-            if (v && v.s_status === 'invalid') {
-                v.s_status = '';
-                v.need_upd = true; // v1.3.7: пометить для перепроверки
-                await cursor.update(v);
-                reset++;
-            }
-        }
-        await tx.done;
-        if (reset > 0) log('info', 'bg', 'миграция: сброшен статус invalid у записей: ' + reset);
-    } catch (e) { console.warn('resetInvalidStatuses error:', e); }
-}
-
-const OLD_STATUS_MIGRATED_KEY = 'fsd_old_status_migrated';
-async function restoreOldStatuses() {
-    try {
-        // v1.3.9: один раз — add_sl теперь сам пишет нормализованный статус;
-        // раньше каждое пробуждение SW сканило всю БД и меняло ongoing↔old,
-        // из-за чего записи «менялись сами» после перезапуска
-        const flag = await chrome.storage.local.get(OLD_STATUS_MIGRATED_KEY);
-        if (flag[OLD_STATUS_MIGRATED_KEY]) return;
-        const db = await getDB();
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        let restored = 0;
+        let converted = 0;
         for await (const cursor of tx.store) {
             const v = cursor.value;
             if (!v) continue;
-            const resolved = resolveStatus(v.s_status || '', v.date_upd);
-            if (resolved !== v.s_status) {
-                v.s_status = resolved;
+            const legacy = splitLegacyStatus(v.s_status || '');
+            let s_status = legacy.s_status;
+            let s_att = ATTEMPT_STATUSES.has(v.s_att) ? v.s_att : legacy.s_att;
+            if (s_att === '' && v.file_p !== '') s_att = 'ok';
+            // need_upd — функция от домена попытки: расщепление обязано
+            // пересчитать флаг (например, свежая ongoing с need_upd=false
+            // иначе навсегда выпала бы из «Загрузить» и автопроверки)
+            const need_upd = computeNeedUpd(s_att, s_status, v.date_upd);
+            let changed = s_status !== (v.s_status || '') || s_att !== (v.s_att || '')
+                || v.need_upd !== need_upd;
+            if (v.t_att === undefined) changed = true;
+            if (changed) {
+                v.s_status = s_status;
+                v.s_att = s_att;
+                if (typeof v.t_att !== 'number' || !Number.isFinite(v.t_att)) v.t_att = 0;
+                v.need_upd = need_upd;
                 await cursor.update(v);
-                restored++;
+                converted++;
             }
         }
         await tx.done;
-        await chrome.storage.local.set({ [OLD_STATUS_MIGRATED_KEY]: true });
-        if (restored > 0) log('info', 'bg', 'миграция: восстановлен статус old у записей: ' + restored);
-    } catch (e) { console.warn('restoreOldStatuses error:', e); }
+        await chrome.storage.local.set({ [STATUS_SPLIT_MIGRATED_KEY]: true });
+        if (converted > 0) log('info', 'bg', 'миграция v1.4.0: разделение статусов (история/попытка), записей: ' + converted);
+    } catch (e) { console.warn('migrateStatusSplit error:', e); }
 }
 
 const NEED_UPD_MIGRATED_KEY = 'fsd_need_upd_migrated';
@@ -1160,7 +1230,7 @@ async function migrateNeedUpdIfNeeded() {
         for await (const cursor of tx.store) {
             const v = cursor.value;
             if (v && typeof v.need_upd !== 'boolean') {
-                v.need_upd = computeNeedUpd(v.s_status, v.date_upd);
+                v.need_upd = computeNeedUpd(v.s_att, v.s_status, v.date_upd);
                 await cursor.update(v);
                 updated++;
             }
@@ -1401,7 +1471,9 @@ async function handleAddUrls(mess) {
 chrome.runtime.onStartup.addListener(async () => { console.log('onStartup: браузер запущен, инициализация SW'); await init(); });
 chrome.runtime.onInstalled.addListener(async (details) => {
     console.log('onInstalled:', details.reason);
-    if (details.reason === 'update' || details.reason === 'install') await resetInvalidStatuses();
+    // v1.4.0: resetInvalidStatuses убран — он сбрасывал диагноз invalid при
+    // КАЖДОМ обновлении расширения; теперь invalid живёт в s_att и не
+    // переспрашивается, пока пользователь не запустит «проверить все»
     await init();
 });
 
@@ -1415,7 +1487,7 @@ async function init() {
         await restoreAllState();
         await setupAutoCheckAlarm();
         await normalizeDatesIfNeeded();
-        await restoreOldStatuses();
+        await migrateStatusSplitIfNeeded(); // v1.4.0: до пересчёта need_upd — split даёт s_att
         await migrateNeedUpdIfNeeded(); // v1.3.7
         await updateMetrics(m => { m.sw_restarts++; m.last_sw_start = Date.now(); return m; });
         await resumeProcessingIfNeeded();

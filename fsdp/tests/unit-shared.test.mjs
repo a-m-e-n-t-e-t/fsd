@@ -27,13 +27,38 @@ check('normalize: мусор → \'\'', shared.normalize('not a url') === '');
 check('buildFileName: ff', shared.buildFileName('https://www.fanfiction.net/s/14064024/1') === 'ff_14064024');
 check('buildFileName: ao3', shared.buildFileName('https://archiveofourown.org/works/12345') === 'ao3_12345');
 
-// === resolveStatus ===
-check('resolveStatus: ongoing давний → old',
-    shared.resolveStatus('ongoing', '2000-01-01') === 'old');
-check('resolveStatus: ongoing свежий → ongoing',
-    shared.resolveStatus('ongoing', new Date().toISOString()) === 'ongoing');
-check('resolveStatus: completed не меняется',
-    shared.resolveStatus('completed', '2000-01-01') === 'completed');
+// === splitLegacyStatus (v1.4.0) ===
+check('splitLegacy: статус попытки выезжает в s_att',
+    (() => { const r = shared.splitLegacyStatus('not_found'); return r.s_status === '' && r.s_att === 'not_found'; })());
+check('splitLegacy: timeout → s_att',
+    (() => { const r = shared.splitLegacyStatus('timeout'); return r.s_status === '' && r.s_att === 'timeout'; })());
+check('splitLegacy: invalid → s_att',
+    (() => { const r = shared.splitLegacyStatus('invalid'); return r.s_status === '' && r.s_att === 'invalid'; })());
+check('splitLegacy: old разворачивается в ongoing (эвристика упразднена)',
+    shared.splitLegacyStatus('old').s_status === 'ongoing');
+check('splitLegacy: ongoing/completed/сырые статусы фикхаба не меняются',
+    shared.splitLegacyStatus('ongoing').s_status === 'ongoing'
+    && shared.splitLegacyStatus('completed').s_status === 'completed'
+    && shared.splitLegacyStatus('').s_status === '');
+
+// === computeNeedUpd (v1.4.0: сигнатура s_att, s_status, date_upd) ===
+check('needUpd: попытки не было (\'\') → true',
+    shared.computeNeedUpd('', 'completed', '2026-01-01') === true);
+check('needUpd: timeout/not_found → true',
+    shared.computeNeedUpd('timeout', 'completed', '2026-01-01') === true
+    && shared.computeNeedUpd('not_found', '', '') === true);
+check('needUpd: invalid → false (диагноз файла, API не поможет)',
+    shared.computeNeedUpd('invalid', 'ongoing', '2026-01-01') === false);
+check('needUpd: ok + ongoing свежий → true (ловить новые главы)',
+    shared.computeNeedUpd('ok', 'ongoing', new Date().toISOString()) === true);
+check('needUpd: ok + ongoing давний (>5 лет) → false (заброшена — без статуса old)',
+    shared.computeNeedUpd('ok', 'ongoing', '2000-01-01') === false);
+check('needUpd: ok + ongoing без даты → true',
+    shared.computeNeedUpd('ok', 'ongoing', '') === true);
+check('needUpd: ok + completed → false',
+    shared.computeNeedUpd('ok', 'completed', new Date().toISOString()) === false);
+check('needUpd: ok + без статуса → false',
+    shared.computeNeedUpd('ok', '', new Date().toISOString()) === false);
 
 // === validateDownloadedFile ===
 const S = shared.SETTINGS_DEFAULTS;
