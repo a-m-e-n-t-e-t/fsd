@@ -101,6 +101,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 function alarmDelay(name, delayMs) {
     return new Promise((resolve) => {
+        // v1.4.1: коллизия имён (зомби-ветка старого цикла обработки + новый
+        // цикл на той же попытке 429) раньше оставляла первый waiter висеть
+        // навсегда: alarm пересоздан под новым waiter'ом, старый promise не
+        // резолвился — URL «застревал» до ложного убийства KEEPALIVE
+        // (ложный timeout в БД и метриках). Резолвим вытесненного waiter'а.
+        const prev = pendingAlarmWaits.get(name);
+        if (prev) prev();
         pendingAlarmWaits.set(name, resolve);
         chrome.alarms.create(name, { delayInMinutes: Math.max(delayMs / 60000, 0.5) });
     });
@@ -532,7 +539,9 @@ async function fix(arr_file_p = []) {
         else if (recordsDiffer(record_sl, original)) fieldChanges.push(record_sl);
     }
     
-    for (const record of fieldChanges) tx.store.put(record).catch(() => {});
+    // v1.4.1: ошибки записи больше не глотаются молча — потеря данных должна
+    // оставлять след в консоли (квота, abort транзакции и т.п.)
+    for (const record of fieldChanges) tx.store.put(record).catch(e => console.error('fix: ошибка записи:', record.url_s, e));
     for (const change of keyChanges) {
         try {
             const exist_new = await tx.store.get(change.record.url_s);
